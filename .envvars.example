@@ -1,0 +1,41 @@
+# ============================================================
+# .envvars — Variables de entorno para Agente RutaSat v1.1
+# Renombrar este archivo a .envvars y completar los valores.
+# NUNCA subir este archivo a Git (agregar al .gitignore).
+# ============================================================
+
+# --- RUTASAT GPS ---
+RUTASAT_EMAIL=tu@email.com
+RUTASAT_PASSWORD=tu_password_aqui
+
+# --- TWILIO WHATSAPP ---
+TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
+
+# Template SID (opcional — necesario para iniciar conversaciones sin sesion activa)
+# Crear en: https://console.twilio.com/us1/develop/sms/content-template-builder
+# TWILIO_CONTENT_SID=HXxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# --- ADMINS (whatsapp:+549XXXXXXXXXX) ---
+ADMIN_WHATSAPP=whatsapp:+549XXXXXXXXXX
+# ADMIN2_WHATSAPP=whatsapp:+549XXXXXXXXXX
+# ADMIN3_WHATSAPP=whatsapp:+549XXXXXXXXXX
+
+# --- ANTHROPIC (Claude IA) ---
+# Sin esta clave el agente funciona en modo basico (sin IA)
+ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# --- TOMTOM TRAFICO (opcional) ---
+# Obtener en: https://developer.tomtom.com/ (plan gratuito disponible)
+# Sin esta clave el agente funciona sin alertas de trafico
+# TOMTOM_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# --- PARAMETROS DE MONITOREO ---
+POLL_SECONDS=120
+LIMITE_RUTA=83
+LIMITE_URBANO=60
+IDLE_MINUTES=5
+
+# --- SERVIDOR WEB ---
+PORT=5000
