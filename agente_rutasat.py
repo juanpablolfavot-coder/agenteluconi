@@ -6,9 +6,11 @@ Notificaciones: WhatsApp via Twilio
 Alertas: Exceso de velocidad, Ralenti, Reporte horario, Resumen diario
 Extras: Clima (Open-Meteo, gratis) + Trafico (TomTom, opcional)
 
-Cambios v1.2:
-- Límite 110 km/h para KWID, Sandero Cross, Kangoo (por patente o nombre)
+Cambios:
+- Límite general de ruta: 80 km/h
+- Límite 110 km/h SOLO para patentes cargadas en PATENTES_110
 - Informes muestran TODOS los vehículos con ubicación y link Maps
+- Mensajes largos de WhatsApp se parten en varios bloques para evitar error 21617
 """
 
 from utils_env import load_env
@@ -47,7 +49,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 TOMTOM_API_KEY    = os.getenv("TOMTOM_API_KEY", "")
 
 POLL_SECONDS  = int(os.getenv("POLL_SECONDS",  "120"))
-LIMITE_RUTA   = int(os.getenv("LIMITE_RUTA",   "83"))
+LIMITE_RUTA   = int(os.getenv("LIMITE_RUTA",   "80"))
 LIMITE_URBANO = int(os.getenv("LIMITE_URBANO", "60"))
 IDLE_MINUTES  = int(os.getenv("IDLE_MINUTES",  "5"))
 
@@ -68,7 +70,7 @@ DISPOSITIVOS_EXCLUIDOS: set = set()
 
 # ---------------------------------------------------------------------------
 # VEHÍCULOS CON LÍMITE 110 km/h (autopista / ruta nacional)
-# Agregar patentes acá cuando las tengas, en MAYÚSCULAS sin espacios ni guiones
+# SOLO por patente, en MAYÚSCULAS y sin espacios ni guiones
 # Ejemplo: PATENTES_110 = {"AB123CD", "EF456GH", "IJ789KL"}
 # ---------------------------------------------------------------------------
 PATENTES_110: set = {
@@ -78,13 +80,7 @@ PATENTES_110: set = {
     "AH156HY", "AH56HX",
     # Sandero
     "AG369ZD", "AG369ZC", "AG677LX", "AG677LW",
-    # Partner — límite estándar de ruta (83), NO incluido acá
-    # Fox — límite estándar de ruta (83), NO incluido acá
 }
-
-# Palabras clave en el nombre del dispositivo que también activan límite 110
-# (respaldo si la patente no matchea exacto)
-KEYWORDS_110 = ["KWID", "SANDERO", "KANGOO"]
 
 # ---------------------------------------------------------------------------
 # MAPA PATENTE → NOMBRE LEGIBLE
@@ -108,13 +104,12 @@ def get_speed_limit(vehicle):
     """Devuelve el límite de velocidad para un vehículo dado."""
     lat   = vehicle["lat"]
     lng   = vehicle["lng"]
-    name  = vehicle["name"].upper()
     plate = vehicle["plate"].upper().replace(" ", "")
 
     if is_in_urban(lat, lng):
         return LIMITE_URBANO, "URBANO"
 
-    if plate in PATENTES_110 or any(kw in name for kw in KEYWORDS_110):
+    if plate in PATENTES_110:
         return 110, "RUTA-110"
 
     return LIMITE_RUTA, "RUTA"
@@ -178,7 +173,6 @@ def split_whatsapp_text(text, limit=MAX_WA_BODY):
     if not text:
         return []
 
-    # Reservo espacio por si agregamos prefijo tipo "(1/3)"
     hard_limit = max(200, limit - 12)
 
     parts = []
@@ -200,7 +194,6 @@ def split_whatsapp_text(text, limit=MAX_WA_BODY):
             parts.append(current)
             current = ""
 
-        # Si una sola linea supera el limite, la partimos por espacios
         while len(line) > hard_limit:
             cut = line.rfind(" ", 0, hard_limit)
             if cut < hard_limit // 2:
@@ -353,7 +346,6 @@ def send_whatsapp(client, to, body):
         try:
             enviados.append(_send_single_whatsapp(client, to, parte, has_session))
         except Exception as e:
-            # Reintento extra si igual Twilio lo ve largo
             if "21617" in str(e) and len(parte) > 500:
                 subpartes = split_whatsapp_text(parte, 800)
                 for sub in subpartes:
@@ -768,25 +760,21 @@ def generar_reporte_horario(vehicles):
         if e.get("type") == "ralenti" and (ahora_ts - e.get("ts", 0)) < 3600
     ]
 
-    # Alertas acumuladas del dia (desde CSV)
     alertas_por_patente                 = _leer_alertas_csv_hoy()
     alertas_texto_bloque, total_alertas = _construir_bloque_alertas(alertas_por_patente, hora)
 
-    # Clima
     ref           = en_movimiento[0] if en_movimiento else (estacionados[0] if estacionados else None)
     lat_ref       = ref["lat"] if ref else -32.16
     lng_ref       = ref["lng"] if ref else -64.10
     w             = get_weather(lat_ref, lng_ref)
     clima_general = format_weather_short(w)
 
-    # Trafico
     trafico_general = ""
     if TOMTOM_API_KEY:
         incidents = get_traffic_incidents(lat_ref, lng_ref)
         if incidents and has_significant_traffic(incidents):
             trafico_general = format_traffic_short(incidents)
 
-    # --- SIN IA ---
     if not claude_client:
         msg  = f"*🚛 REPORTE FLOTA - {hora}hs ({fecha})*\n\n"
         msg += "*Estado General*\n"
@@ -817,7 +805,6 @@ def generar_reporte_horario(vehicles):
         msg += "*Estado:* Revisar alertas ⚠️" if total_alertas > 0 else "*Estado:* Todo normal 👍"
         return msg
 
-    # --- CON IA ---
     mov_data = [
         f"{display_name(v['plate'])} a {v['speed_kmh']:.0f}km/h (lim {v['limit']}km/h) {maps_link(v['lat'], v['lng'])}"
         for v in en_movimiento
@@ -1009,7 +996,6 @@ def main():
 
     print("\nAgente RutaSat v1.2 corriendo")
     print(f"  Poll: {POLL_SECONDS}s | Ruta: {LIMITE_RUTA}km/h | Urbano: {LIMITE_URBANO}km/h | Ruta-110: 110km/h")
-    print(f"  Vehiculos 110km/h - Keywords: {', '.join(KEYWORDS_110)}")
     if PATENTES_110:
         print(f"  Vehiculos 110km/h - Patentes: {', '.join(PATENTES_110)}")
     print(f"  Admin: {ADMIN_WHATSAPP}")
