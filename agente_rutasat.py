@@ -51,6 +51,9 @@ LIMITE_RUTA   = int(os.getenv("LIMITE_RUTA",   "83"))
 LIMITE_URBANO = int(os.getenv("LIMITE_URBANO", "60"))
 IDLE_MINUTES  = int(os.getenv("IDLE_MINUTES",  "5"))
 
+# Margen seguro para Twilio WhatsApp
+MAX_WA_BODY = int(os.getenv("MAX_WA_BODY", "1300"))
+
 SPEED_EXCEED_MINUTES = 3
 
 # Zonas urbanas — ajustar segun la empresa
@@ -166,6 +169,57 @@ def knots_to_kmh(knots):
     return float(knots or 0) * 1.852
 
 
+def split_whatsapp_text(text, limit=MAX_WA_BODY):
+    """
+    Parte un mensaje largo en bloques seguros para Twilio.
+    Prioriza cortes por salto de linea o espacio.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    # Reservo espacio por si agregamos prefijo tipo "(1/3)"
+    hard_limit = max(200, limit - 12)
+
+    parts = []
+    current = ""
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+
+        if not current:
+            candidate = line
+        else:
+            candidate = current + "\n" + line
+
+        if len(candidate) <= hard_limit:
+            current = candidate
+            continue
+
+        if current:
+            parts.append(current)
+            current = ""
+
+        # Si una sola linea supera el limite, la partimos por espacios
+        while len(line) > hard_limit:
+            cut = line.rfind(" ", 0, hard_limit)
+            if cut < hard_limit // 2:
+                cut = hard_limit
+            parts.append(line[:cut].rstrip())
+            line = line[cut:].lstrip()
+
+        current = line
+
+    if current:
+        parts.append(current)
+
+    if len(parts) <= 1:
+        return parts
+
+    total = len(parts)
+    return [f"({i}/{total})\n{part}" for i, part in enumerate(parts, 1)]
+
+
 # ---------------------------------------------------------------------------
 # RUTASAT API
 # ---------------------------------------------------------------------------
@@ -194,7 +248,7 @@ def get_rutasat_token():
 
     _rutasat_token        = r2.text.strip()
     _rutasat_token_expiry = ahora + (29 * 86400)
-    print(f"  RutaSat token OK (expira en 30 dias)")
+    print("  RutaSat token OK (expira en 30 dias)")
     return _rutasat_token
 
 
@@ -244,16 +298,23 @@ def build_vehicle_list(devices, positions):
 # ---------------------------------------------------------------------------
 # WHATSAPP (Twilio)
 # ---------------------------------------------------------------------------
-def send_whatsapp(client, to, body):
-    ahora       = time.time()
-    has_session = (ahora - wa_session_active.get(to, 0)) < 86400
-
+def _send_single_whatsapp(client, to, body, has_session):
+    """
+    Envia un solo bloque de mensaje.
+    Si hay ventana activa de 24h intenta body directo.
+    Si no, intenta template si existe.
+    """
     if has_session:
         try:
-            return client.messages.create(from_=TWILIO_WHATSAPP_FROM, to=to, body=body)
+            return client.messages.create(
+                from_=TWILIO_WHATSAPP_FROM,
+                to=to,
+                body=body,
+            )
         except Exception as e:
             if "63112" in str(e):
                 wa_session_active.pop(to, None)
+                has_session = False
             else:
                 raise
 
@@ -270,7 +331,37 @@ def send_whatsapp(client, to, body):
         except Exception as e:
             print(f"  Error template: {e}")
 
-    return client.messages.create(from_=TWILIO_WHATSAPP_FROM, to=to, body=body)
+    return client.messages.create(
+        from_=TWILIO_WHATSAPP_FROM,
+        to=to,
+        body=body,
+    )
+
+
+def send_whatsapp(client, to, body):
+    body = (body or "").strip()
+    if not body:
+        return []
+
+    ahora       = time.time()
+    has_session = (ahora - wa_session_active.get(to, 0)) < 86400
+
+    partes = split_whatsapp_text(body, MAX_WA_BODY)
+    enviados = []
+
+    for parte in partes:
+        try:
+            enviados.append(_send_single_whatsapp(client, to, parte, has_session))
+        except Exception as e:
+            # Reintento extra si igual Twilio lo ve largo
+            if "21617" in str(e) and len(parte) > 500:
+                subpartes = split_whatsapp_text(parte, 800)
+                for sub in subpartes:
+                    enviados.append(_send_single_whatsapp(client, to, sub, has_session))
+            else:
+                raise
+
+    return enviados
 
 
 def send_to_admins(client, body):
@@ -350,9 +441,12 @@ def format_weather_short(w):
     wind  = w.get("wind_speed", 0) or 0
     gusts = w.get("wind_gusts", 0) or 0
     rain  = w.get("rain", 0) or 0
-    if wind  > 20: msg += f", viento {wind:.0f}km/h"
-    if gusts > 40: msg += f" (rafagas {gusts:.0f})"
-    if rain  > 0:  msg += f", lluvia {rain:.1f}mm"
+    if wind  > 20:
+        msg += f", viento {wind:.0f}km/h"
+    if gusts > 40:
+        msg += f" (rafagas {gusts:.0f})"
+    if rain  > 0:
+        msg += f", lluvia {rain:.1f}mm"
     return msg
 
 
@@ -363,11 +457,16 @@ def is_weather_risky(w):
     code  = w.get("weather_code", 0)
     gusts = w.get("wind_gusts", 0) or 0
     rain  = w.get("rain", 0) or 0
-    if code >= 61:        risks.append("lluvia/tormenta")
-    elif code >= 51:      risks.append("llovizna")
-    if code in (45, 48):  risks.append("niebla")
-    if gusts > 60:        risks.append(f"rafagas {gusts:.0f}km/h")
-    if rain  > 5:         risks.append(f"lluvia {rain:.1f}mm")
+    if code >= 61:
+        risks.append("lluvia/tormenta")
+    elif code >= 51:
+        risks.append("llovizna")
+    if code in (45, 48):
+        risks.append("niebla")
+    if gusts > 60:
+        risks.append(f"rafagas {gusts:.0f}km/h")
+    if rain > 5:
+        risks.append(f"lluvia {rain:.1f}mm")
     return bool(risks), ", ".join(risks)
 
 
@@ -410,7 +509,7 @@ def get_traffic_incidents(lat, lng, radius_km=5):
                 "from":      props.get("from", ""),
                 "delay":     props.get("delay") or 0,
                 "magnitude": props.get("magnitudeOfDelay", 0),
-                "events":    [e.get("description","") for e in props.get("events",[]) if e.get("description")],
+                "events":    [e.get("description", "") for e in props.get("events", []) if e.get("description")],
             })
 
         traffic_cache[cache_key] = {"ts": ahora, "data": incidents}
@@ -522,7 +621,7 @@ Responde SOLO con JSON: {{"admin": "...", "severity": "baja|media|alta"}}"""
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )
-        text = response.content[0].text.strip().replace("```json","").replace("```","").strip()
+        text = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
         return json.loads(text)
     except Exception as e:
         print(f"  IA alerta error: {e}")
@@ -574,7 +673,7 @@ def _construir_bloque_alertas(alertas_por_patente, hora):
         lines = [f"*Alertas del Dia* ⚠️ ({total} total desde 00:00 a {hora})"]
         for p, d in sorted(alertas_por_patente.items(), key=lambda x: x[1]["cantidad"], reverse=True):
             lines.append(
-                f"  · {p} - {d['cantidad']} alerta{'s' if d['cantidad']>1 else ''} "
+                f"  · {p} - {d['cantidad']} alerta{'s' if d['cantidad'] > 1 else ''} "
                 f"(max {d['max_vel']:.0f}km/h a las {d['hora']})"
             )
         return "\n".join(lines), total
@@ -640,17 +739,17 @@ def generar_reporte_horario(vehicles):
     hora  = now_local().strftime("%H:%M")
     fecha = now_local().strftime("%d/%m")
 
-    vehicles  = [v for v in vehicles if v["plate"] not in DISPOSITIVOS_EXCLUIDOS]
-    total     = len(vehicles)
-    ahora_ts  = time.time()
+    vehicles = [v for v in vehicles if v["plate"] not in DISPOSITIVOS_EXCLUIDOS]
+    total    = len(vehicles)
+    ahora_ts = time.time()
 
     en_movimiento = []
     estacionados  = []
     con_exceso    = []
 
     for v in vehicles:
-        spd           = v["speed_kmh"]
-        limit, zone   = get_speed_limit(v)
+        spd         = v["speed_kmh"]
+        limit, zone = get_speed_limit(v)
 
         if spd > 5:
             en_movimiento.append({**v, "limit": limit, "zone": zone})
@@ -690,7 +789,7 @@ def generar_reporte_horario(vehicles):
     # --- SIN IA ---
     if not claude_client:
         msg  = f"*🚛 REPORTE FLOTA - {hora}hs ({fecha})*\n\n"
-        msg += f"*Estado General*\n"
+        msg += "*Estado General*\n"
         msg += f"  · Total: {total} | Activos: {len(en_movimiento)} | Parados: {len(estacionados)}\n"
         if clima_general:
             msg += f"  · Clima: {clima_general}\n"
@@ -719,17 +818,16 @@ def generar_reporte_horario(vehicles):
         return msg
 
     # --- CON IA ---
-    # Preparar datos detallados de todos los vehículos para la IA
     mov_data = [
-        f"{display_name(v['plate'])} a {v['speed_kmh']:.0f}km/h (lim {v['limit']}km/h) {maps_link(v['lat'],v['lng'])}"
+        f"{display_name(v['plate'])} a {v['speed_kmh']:.0f}km/h (lim {v['limit']}km/h) {maps_link(v['lat'], v['lng'])}"
         for v in en_movimiento
     ]
     est_data = [
-        f"{display_name(v['plate'])} {'motor ON' if v.get('ignition') else 'motor OFF'} {maps_link(v['lat'],v['lng'])}"
+        f"{display_name(v['plate'])} {'motor ON' if v.get('ignition') else 'motor OFF'} {maps_link(v['lat'], v['lng'])}"
         for v in estacionados
     ]
     exc_data = [
-        f"{display_name(v['plate'])} a {v['speed_kmh']:.0f}km/h (lim {v['limit']}km/h) {maps_link(v['lat'],v['lng'])}"
+        f"{display_name(v['plate'])} a {v['speed_kmh']:.0f}km/h (lim {v['limit']}km/h) {maps_link(v['lat'], v['lng'])}"
         for v in con_exceso
     ]
     ral_data = [f"{r['vehicle_key']} ({r['minutes']}min)" for r in ralenti_hora]
@@ -866,11 +964,27 @@ def create_webhook_app():
             else:
                 respuesta = "Mensaje recibido. Comandos: reporte, resumen, clima, trafico, ayuda"
 
-            send_whatsapp(twilio_cl, from_number, respuesta)
+            try:
+                send_whatsapp(twilio_cl, from_number, respuesta)
+            except Exception as e:
+                print(f"  Error enviando respuesta WA: {e}")
+                try:
+                    send_whatsapp(
+                        twilio_cl,
+                        from_number,
+                        "No pude enviar el mensaje completo por WhatsApp. El reporte salió demasiado largo."
+                    )
+                except Exception as e2:
+                    print(f"  Error enviando fallback WA: {e2}")
+
             return "OK", 200
 
-        send_to_admins(twilio_cl, f"Mensaje de {from_number}: {body}")
-        send_whatsapp(twilio_cl, from_number, "Recibido. Tu mensaje fue registrado.")
+        try:
+            send_to_admins(twilio_cl, f"Mensaje de {from_number}: {body}")
+            send_whatsapp(twilio_cl, from_number, "Recibido. Tu mensaje fue registrado.")
+        except Exception as e:
+            print(f"  Error webhook no-admin: {e}")
+
         return "OK", 200
 
     return app
@@ -900,9 +1014,10 @@ def main():
         print(f"  Vehiculos 110km/h - Patentes: {', '.join(PATENTES_110)}")
     print(f"  Admin: {ADMIN_WHATSAPP}")
     print(f"  IA Claude: {'Activada' if claude_client else 'Modo basico'}")
-    print(f"  Clima: Open-Meteo (gratis, sin API key)")
+    print("  Clima: Open-Meteo (gratis, sin API key)")
     print(f"  Trafico TomTom: {'Activado' if TOMTOM_API_KEY else 'No configurado (opcional)'}")
     print(f"  Template WA: {'Configurado' if TWILIO_CONTENT_SID else 'No configurado'}")
+    print(f"  MAX_WA_BODY: {MAX_WA_BODY}")
     print()
 
     global last_hourly_report
@@ -986,13 +1101,21 @@ def main():
 
                                 send_to_admins(twilio, idle_msg)
                                 daily_events.append({
-                                    "vehicle_key": plate, "type": "ralenti",
+                                    "vehicle_key": plate,
+                                    "type": "ralenti",
                                     "minutes": f"{minutos_idle:.0f}",
-                                    "lat": lat, "lng": lng, "ts": ahora_ts,
+                                    "lat": lat,
+                                    "lng": lng,
+                                    "ts": ahora_ts,
                                 })
                                 log_event({
-                                    "ts": ahora_ts, "vehicle_key": plate, "type": "ralenti",
-                                    "minutes": f"{minutos_idle:.0f}", "speed": 0, "limit": 0, "zone": "",
+                                    "ts": ahora_ts,
+                                    "vehicle_key": plate,
+                                    "type": "ralenti",
+                                    "minutes": f"{minutos_idle:.0f}",
+                                    "speed": 0,
+                                    "limit": 0,
+                                    "zone": "",
                                 })
                                 print(f"  RALENTI: {plate} - {minutos_idle:.0f} min")
                     else:
@@ -1019,18 +1142,24 @@ def main():
                     alert_history.setdefault(plate, []).append({"ts": now_iso(), "speed": speed})
                     daily_events.append({
                         "vehicle_key": plate,
-                        "speed": speed, "limit": limit, "zone": zone,
+                        "speed": speed,
+                        "limit": limit,
+                        "zone": zone,
                         "severity": mensajes.get("severity", "media"),
                         "ts": ahora_ts,
                     })
                     log_event({
-                        "ts": ahora_ts, "vehicle_key": plate, "type": "velocidad",
-                        "speed": f"{speed:.1f}", "limit": limit, "zone": zone,
+                        "ts": ahora_ts,
+                        "vehicle_key": plate,
+                        "type": "velocidad",
+                        "speed": f"{speed:.1f}",
+                        "limit": limit,
+                        "zone": zone,
                     })
-                    print(f"  Alerta enviada ({mensajes.get('severity','?')})")
+                    print(f"  Alerta enviada ({mensajes.get('severity', '?')})")
 
                 except Exception as e:
-                    print(f"  Error procesando {v.get('plate','?')}: {e}")
+                    print(f"  Error procesando {v.get('plate', '?')}: {e}")
                     continue
 
             time.sleep(POLL_SECONDS)
