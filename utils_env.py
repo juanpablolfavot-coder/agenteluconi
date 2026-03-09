@@ -1,37 +1,37 @@
 """
-utils_env.py — Carga variables de entorno desde un archivo .envvars
-Uso: from utils_env import load_env; load_env(".envvars")
+utils_env.py — Carga variables de entorno desde archivo .envvars (local)
+o directamente del sistema (Render, Railway, etc.)
 """
 
 import os
 
-
 def load_env(path=".envvars"):
     """
-    Lee un archivo de variables de entorno linea por linea.
-    Formato: CLAVE=VALOR
-    Ignora lineas vacias y comentarios (#).
-    No sobreescribe variables ya definidas en el entorno del sistema.
+    Intenta cargar variables desde el archivo path.
+    Si el archivo no existe (ej: en Render), usa las variables
+    del entorno del sistema directamente, sin error.
     """
-    if not os.path.exists(path):
-        print(f"[utils_env] Archivo {path} no encontrado, usando variables del sistema.")
-        return
+    if os.path.exists(path):
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(dotenv_path=path, override=False)
+            print(f"[utils_env] Variables cargadas desde '{path}'")
+        except ImportError:
+            _parse_envfile(path)
+    else:
+        print(f"[utils_env] Archivo '{path}' no encontrado — usando variables del sistema (modo cloud)")
 
+
+def _parse_envfile(path):
+    """Fallback: parsea el archivo .envvars manualmente sin dependencias."""
     with open(path, "r", encoding="utf-8") as f:
-        for linea in f:
-            linea = linea.strip()
-            if not linea or linea.startswith("#"):
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
                 continue
-            if "=" not in linea:
-                continue
-            clave, _, valor = linea.partition("=")
-            clave  = clave.strip()
-            valor  = valor.strip()
-
-            # Remover comillas opcionales alrededor del valor
-            if len(valor) >= 2 and valor[0] in ('"', "'") and valor[-1] == valor[0]:
-                valor = valor[1:-1]
-
-            # No sobreescribir si ya esta definida (ej: en Render/Railway)
-            if clave and clave not in os.environ:
-                os.environ[clave] = valor
+            if "=" in line:
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
