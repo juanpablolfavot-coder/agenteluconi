@@ -1,10 +1,14 @@
 """
-AGENTE IA - Monitor de Flota RutaSat v1.1 - COMPLETO
+AGENTE IA - Monitor de Flota RutaSat v1.2
 
 Plataforma GPS: RutaSat (https://rutasat.com/api/)
 Notificaciones: WhatsApp via Twilio
 Alertas: Exceso de velocidad, Ralenti, Reporte horario, Resumen diario
 Extras: Clima (Open-Meteo, gratis) + Trafico (TomTom, opcional)
+
+Cambios v1.2:
+- Límite 110 km/h para KWID, Sandero Cross, Kangoo (por patente o nombre)
+- Informes muestran TODOS los vehículos con ubicación y link Maps
 """
 
 from utils_env import load_env
@@ -58,6 +62,66 @@ URBAN_BBOXES = {
 
 # Nombres de dispositivos a ignorar (mayusculas)
 DISPOSITIVOS_EXCLUIDOS: set = set()
+
+# ---------------------------------------------------------------------------
+# VEHÍCULOS CON LÍMITE 110 km/h (autopista / ruta nacional)
+# Agregar patentes acá cuando las tengas, en MAYÚSCULAS sin espacios ni guiones
+# Ejemplo: PATENTES_110 = {"AB123CD", "EF456GH", "IJ789KL"}
+# ---------------------------------------------------------------------------
+PATENTES_110: set = {
+    # Kangoo
+    "ORF347", "ORF342",
+    # KWID
+    "AH156HY", "AH56HX",
+    # Sandero
+    "AG369ZD", "AG369ZC", "AG677LX", "AG677LW",
+    # Partner — límite estándar de ruta (83), NO incluido acá
+    # Fox — límite estándar de ruta (83), NO incluido acá
+}
+
+# Palabras clave en el nombre del dispositivo que también activan límite 110
+# (respaldo si la patente no matchea exacto)
+KEYWORDS_110 = ["KWID", "SANDERO", "KANGOO"]
+
+# ---------------------------------------------------------------------------
+# MAPA PATENTE → NOMBRE LEGIBLE
+# Se usa en alertas e informes para mostrar nombre del modelo además de patente
+# ---------------------------------------------------------------------------
+NOMBRE_VEHICULO = {
+    "ORF347":  "Kangoo EX.1.6 #1",
+    "ORF342":  "Kangoo EX.1.6 #2",
+    "KCB412":  "Partner 1.6 HDI",
+    "AH156HY": "KWID #1",
+    "AH56HX":  "KWID #2",
+    "AG369ZD": "Sandero #1",
+    "AG369ZC": "Sandero #2",
+    "AG677LX": "Sandero #3",
+    "AG677LW": "Sandero #4",
+    "JFV680":  "VW Fox 1.6",
+}
+
+
+def get_speed_limit(vehicle):
+    """Devuelve el límite de velocidad para un vehículo dado."""
+    lat   = vehicle["lat"]
+    lng   = vehicle["lng"]
+    name  = vehicle["name"].upper()
+    plate = vehicle["plate"].upper().replace(" ", "")
+
+    if is_in_urban(lat, lng):
+        return LIMITE_URBANO, "URBANO"
+
+    if plate in PATENTES_110 or any(kw in name for kw in KEYWORDS_110):
+        return 110, "RUTA-110"
+
+    return LIMITE_RUTA, "RUTA"
+
+
+def display_name(plate):
+    """Devuelve 'PATENTE (Modelo)' si está en el mapa, si no solo la patente."""
+    clean  = plate.upper().replace(" ", "")
+    nombre = NOMBRE_VEHICULO.get(clean)
+    return f"{plate} ({nombre})" if nombre else plate
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +177,6 @@ def get_rutasat_token():
 
     session = requests.Session()
 
-    # Paso 1: crear sesion con cookie
     r1 = session.post(
         f"{RUTASAT_BASE_URL}/session",
         data={"email": RUTASAT_EMAIL, "password": RUTASAT_PASSWORD},
@@ -121,7 +184,6 @@ def get_rutasat_token():
     )
     r1.raise_for_status()
 
-    # Paso 2: generar Bearer token (30 dias)
     expiration = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
     r2 = session.post(
         f"{RUTASAT_BASE_URL}/session/token",
@@ -587,19 +649,20 @@ def generar_reporte_horario(vehicles):
     con_exceso    = []
 
     for v in vehicles:
-        spd = v["speed_kmh"]
+        spd           = v["speed_kmh"]
+        limit, zone   = get_speed_limit(v)
+
         if spd > 5:
-            en_movimiento.append(v)
-            limit = LIMITE_URBANO if is_in_urban(v["lat"], v["lng"]) else LIMITE_RUTA
+            en_movimiento.append({**v, "limit": limit, "zone": zone})
             if spd > limit:
                 if v["plate"] not in speed_exceed_tracking:
                     speed_exceed_tracking[v["plate"]] = ahora_ts
                 if (ahora_ts - speed_exceed_tracking[v["plate"]]) >= SPEED_EXCEED_MINUTES * 60:
-                    con_exceso.append({**v, "limit": limit})
+                    con_exceso.append({**v, "limit": limit, "zone": zone})
             else:
                 speed_exceed_tracking.pop(v["plate"], None)
         else:
-            estacionados.append(v["plate"])
+            estacionados.append({**v, "limit": limit, "zone": zone})
 
     ralenti_hora = [
         e for e in daily_events
@@ -611,7 +674,7 @@ def generar_reporte_horario(vehicles):
     alertas_texto_bloque, total_alertas = _construir_bloque_alertas(alertas_por_patente, hora)
 
     # Clima
-    ref           = en_movimiento[0] if en_movimiento else None
+    ref           = en_movimiento[0] if en_movimiento else (estacionados[0] if estacionados else None)
     lat_ref       = ref["lat"] if ref else -32.16
     lng_ref       = ref["lng"] if ref else -64.10
     w             = get_weather(lat_ref, lng_ref)
@@ -626,7 +689,7 @@ def generar_reporte_horario(vehicles):
 
     # --- SIN IA ---
     if not claude_client:
-        msg  = f"*🚛 REPORTE FLOTA - {hora}hs*\n\n"
+        msg  = f"*🚛 REPORTE FLOTA - {hora}hs ({fecha})*\n\n"
         msg += f"*Estado General*\n"
         msg += f"  · Total: {total} | Activos: {len(en_movimiento)} | Parados: {len(estacionados)}\n"
         if clima_general:
@@ -634,18 +697,41 @@ def generar_reporte_horario(vehicles):
         if trafico_general:
             msg += f"  · Trafico:\n{trafico_general}\n"
         msg += "\n"
+
         if en_movimiento:
             msg += "*En Movimiento* 🚗\n"
             for v in en_movimiento:
-                msg += f"  · {v['plate']} - {v['speed_kmh']:.0f}km/h [{maps_link(v['lat'],v['lng'])}]\n"
+                exceso_tag = f" ⚠️ excede {v['limit']}km/h!" if v["speed_kmh"] > v["limit"] else ""
+                msg += f"  · {display_name(v['plate'])} - {v['speed_kmh']:.0f}km/h{exceso_tag}\n"
+                msg += f"    {maps_link(v['lat'], v['lng'])}\n"
             msg += "\n"
+
+        if estacionados:
+            msg += "*Estacionados / Sin Movimiento* 🅿️\n"
+            for v in estacionados:
+                estado = "🔑 Motor ON" if v.get("ignition") else "⭕ Motor OFF"
+                msg += f"  · {display_name(v['plate'])} - {estado}\n"
+                msg += f"    {maps_link(v['lat'], v['lng'])}\n"
+            msg += "\n"
+
         msg += alertas_texto_bloque + "\n\n"
         msg += "*Estado:* Revisar alertas ⚠️" if total_alertas > 0 else "*Estado:* Todo normal 👍"
         return msg
 
     # --- CON IA ---
-    mov_data = [f"{v['plate']} a {v['speed_kmh']:.0f}km/h {maps_link(v['lat'],v['lng'])}" for v in en_movimiento]
-    exc_data = [f"{v['plate']} a {v['speed_kmh']:.0f}km/h (lim {v['limit']}) {maps_link(v['lat'],v['lng'])}" for v in con_exceso]
+    # Preparar datos detallados de todos los vehículos para la IA
+    mov_data = [
+        f"{display_name(v['plate'])} a {v['speed_kmh']:.0f}km/h (lim {v['limit']}km/h) {maps_link(v['lat'],v['lng'])}"
+        for v in en_movimiento
+    ]
+    est_data = [
+        f"{display_name(v['plate'])} {'motor ON' if v.get('ignition') else 'motor OFF'} {maps_link(v['lat'],v['lng'])}"
+        for v in estacionados
+    ]
+    exc_data = [
+        f"{display_name(v['plate'])} a {v['speed_kmh']:.0f}km/h (lim {v['limit']}km/h) {maps_link(v['lat'],v['lng'])}"
+        for v in con_exceso
+    ]
     ral_data = [f"{r['vehicle_key']} ({r['minutes']}min)" for r in ralenti_hora]
 
     prompt = f"""Genera reporte horario de flota para WhatsApp.
@@ -654,27 +740,36 @@ DATOS ({hora} del {fecha}):
 - Clima: {clima_general}
 - Trafico: {trafico_general if trafico_general else 'sin incidentes relevantes'}
 - Total vehiculos: {total}
-- En movimiento ({len(en_movimiento)}): {', '.join(mov_data) if mov_data else 'ninguno'}
-- Estacionados ({len(estacionados)}): {', '.join(estacionados[:10]) if estacionados else 'ninguno'}
-- Con exceso ahora ({len(con_exceso)}): {', '.join(exc_data) if exc_data else 'ninguno'}
-- Ralenti ultima hora ({len(ralenti_hora)}): {', '.join(ral_data) if ral_data else 'ninguno'}
 
-=== SECCION OBLIGATORIA ===
+EN MOVIMIENTO ({len(en_movimiento)}):
+{chr(10).join(mov_data) if mov_data else 'ninguno'}
+
+ESTACIONADOS / SIN MOVIMIENTO ({len(estacionados)}) — incluir TODOS con ubicacion:
+{chr(10).join(est_data) if est_data else 'ninguno'}
+
+CON EXCESO DE VELOCIDAD AHORA ({len(con_exceso)}):
+{chr(10).join(exc_data) if exc_data else 'ninguno'}
+
+RALENTI ULTIMA HORA ({len(ralenti_hora)}):
+{chr(10).join(ral_data) if ral_data else 'ninguno'}
+
+=== SECCION OBLIGATORIA — COPIAR EXACTO ===
 {alertas_texto_bloque}
 === FIN SECCION OBLIGATORIA ===
 
-Formato (max 20 lineas):
-1. Titulo con hora
-2. Estado general (vehiculos, clima, trafico si hay incidentes)
-3. Vehiculos en movimiento con velocidad y link Maps
-4. COPIAR la seccion de alertas EXACTAMENTE como aparece arriba
-5. Estado final
-Emojis moderados. *negritas* WhatsApp."""
+Formato para WhatsApp (max 30 lineas):
+1. Titulo con hora y fecha
+2. Estado general (total vehiculos, clima, trafico si hay)
+3. Seccion "En Movimiento" con velocidad y link Maps de cada uno
+4. Seccion "Estacionados" con estado motor y link Maps de CADA UNO (incluir todos)
+5. COPIAR la seccion de alertas EXACTAMENTE como aparece arriba
+6. Estado final
+Usar *negritas* WhatsApp. Emojis moderados."""
 
     try:
         response = claude_client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=800,
+            max_tokens=1200,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -798,8 +893,11 @@ def main():
     last_alert_ts     = {}
     last_summary_date = None
 
-    print("\nAgente RutaSat v1.1 corriendo")
-    print(f"  Poll: {POLL_SECONDS}s | Ruta: {LIMITE_RUTA}km/h | Urbano: {LIMITE_URBANO}km/h")
+    print("\nAgente RutaSat v1.2 corriendo")
+    print(f"  Poll: {POLL_SECONDS}s | Ruta: {LIMITE_RUTA}km/h | Urbano: {LIMITE_URBANO}km/h | Ruta-110: 110km/h")
+    print(f"  Vehiculos 110km/h - Keywords: {', '.join(KEYWORDS_110)}")
+    if PATENTES_110:
+        print(f"  Vehiculos 110km/h - Patentes: {', '.join(PATENTES_110)}")
     print(f"  Admin: {ADMIN_WHATSAPP}")
     print(f"  IA Claude: {'Activada' if claude_client else 'Modo basico'}")
     print(f"  Clima: Open-Meteo (gratis, sin API key)")
@@ -900,9 +998,8 @@ def main():
                     else:
                         idle_tracking.pop(plate, None)
 
-                    # VELOCIDAD
-                    limit = LIMITE_URBANO if is_in_urban(lat, lng) else LIMITE_RUTA
-                    zone  = "URBANO" if limit == LIMITE_URBANO else "RUTA"
+                    # VELOCIDAD — usar get_speed_limit()
+                    limit, zone = get_speed_limit(v)
 
                     if speed <= limit:
                         speed_exceed_tracking.pop(plate, None)
@@ -913,8 +1010,9 @@ def main():
 
                     last_alert_ts[plate] = ahora_ts
 
-                    print(f"  {plate} -> {speed:.0f} km/h (lim {limit}, {zone})")
-                    mensajes = ia_generar_alerta(plate, speed, limit, zone, lat, lng)
+                    dname = display_name(plate)
+                    print(f"  {dname} -> {speed:.0f} km/h (lim {limit}, {zone})")
+                    mensajes = ia_generar_alerta(dname, speed, limit, zone, lat, lng)
 
                     send_to_admins(twilio, f"{mensajes['admin']}\n{maps_link(lat, lng)}")
 
