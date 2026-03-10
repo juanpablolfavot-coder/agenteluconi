@@ -1,5 +1,5 @@
 """
-AGENTE IA - Monitor de Flota RutaSat v1.5
+AGENTE IA - Monitor de Flota RutaSat v1.6
 
 Plataforma GPS: RutaSat (https://rutasat.com/api/)
 Notificaciones: WhatsApp via Twilio
@@ -7,7 +7,7 @@ Alertas: Exceso de velocidad, Ralenti, Reporte horario, Resumen diario
 Extras: Clima (Open-Meteo, gratis) + Trafico (TomTom, opcional)
 Cierre 18hs: inicio de jornada, fin de jornada, viajes y paradas por patente
 
-Cambios v1.5:
+Cambios v1.6:
 - Límite general de ruta: 80 km/h
 - Límite 110 km/h SOLO para patentes cargadas en PATENTES_110
 - Antes de 20:30: reporte horario SOLO si hay vehículos en movimiento
@@ -15,6 +15,7 @@ Cambios v1.5:
 - Ubicación en reporte como coordenadas, SIN links de Maps
 - Después de 20:30: NO hay reporte horario; solo alerta automática si algún vehículo se mueve
 - Ralenti excluido SOLO para Motomel gris A241VOY (46)
+- Fix cierre 18hs: extrae patente real desde el nombre del dispositivo en RutaSat
 - Mensajes largos de WhatsApp se parten en varios bloques para evitar error 21617
 - Soporte para ADMIN4_WHATSAPP
 """
@@ -81,7 +82,6 @@ URBAN_BBOXES = {
 DISPOSITIVOS_EXCLUIDOS: set = set()
 
 # Excluir ralenti solo para esta unidad
-# Se compara por contenido para que funcione aunque el nombre del equipo venga más largo
 RALENTI_EXCLUIDOS_MATCH: set = {
     "A241VOY",
 }
@@ -92,6 +92,41 @@ RALENTI_EXCLUIDOS_MATCH: set = {
 # ---------------------------------------------------------------------------
 def normalize_plate(text):
     return re.sub(r"[^A-Z0-9]", "", (text or "").upper())
+
+
+def extract_plate_from_name(text):
+    """
+    Extrae patente real desde nombres como:
+    - Moto A073EQT ALE BRIGNONE (52)
+    - Kangoo/ORF342 (04)
+    - Iveco 56 AF195QL
+    - Sandero AG677LX(33)
+    """
+    raw = (text or "").upper()
+
+    patterns = [
+        r"\b([A-Z]{2}\d{3}[A-Z]{2})\b",  # AF195QL / AA706VW
+        r"\b([A-Z]\d{3}[A-Z]{3})\b",     # A073EQT / A241VOY
+        r"\b([A-Z]{3}\d{3})\b",          # ORF347 / JFV680
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, raw)
+        if m:
+            return m.group(1)
+
+    compact = re.sub(r"[^A-Z0-9]", "", raw)
+
+    for pat in [
+        r"([A-Z]{2}\d{3}[A-Z]{2})",
+        r"([A-Z]\d{3}[A-Z]{3})",
+        r"([A-Z]{3}\d{3})",
+    ]:
+        m = re.search(pat, compact)
+        if m:
+            return m.group(1)
+
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -139,12 +174,12 @@ PATENTES_REPORTE_18: set = {
     "AG677LX",
     "AG677LW",
     "JFV680",
-    "AAA198FWP",
+    "A198FWP",
     "A255DSK",
     "A255DSJ",
     "A276PHM",
     "A276PHN",
-    "AAA198FWR",
+    "A198FWR",
 }
 
 
@@ -219,6 +254,11 @@ def is_in_urban(lat, lng):
 def maps_link(lat, lng):
     return f"https://maps.google.com/?q={lat},{lng}"
 
+def format_coords(lat, lng):
+    return f"{float(lat):.5f}, {float(lng):.5f}"
+
+def):.5f}"
+
 def knots_to_kmh(knots):
     """RutaSat devuelve velocidad en nudos."""
     return float(knots or 0) * 1.852
@@ -239,9 +279,6 @@ def parse_dt_local(value):
 def hhmm(value):
     dt = parse_dt_local(value)
     return dt.strftime("%H:%M") if dt else "--:--"
-
-def format_coords(lat, lng):
-    return f"{float(lat):.5f}, {float(lng):.5f}"
 
 def parse_hhmm(text, default=(20, 30)):
     try:
@@ -271,8 +308,8 @@ def is_after_hours(dt=None):
     if start <= end:
         return start <= hm < end
 
-    # Ventana que cruza medianoche
     return hm >= start or hm < end
+
 
 def is_idle_excluded(vehicle):
     """
@@ -450,10 +487,10 @@ def build_vehicle_list(devices, positions):
         device_id = pos.get("deviceId")
         device    = device_map.get(device_id, {})
         name      = (device.get("name", str(device_id)) or "").strip()
-        plate     = normalize_plate(name)
 
+        plate = extract_plate_from_name(name)
         if not plate:
-            plate = str(device_id)
+            plate = normalize_plate(name) or str(device_id)
 
         if plate in DISPOSITIVOS_EXCLUIDOS:
             continue
@@ -478,9 +515,9 @@ def build_devices_lookup_by_plate(devices):
     out = {}
     for d in devices:
         name = (d.get("name") or "").strip()
-        clean = normalize_plate(name)
-        if clean:
-            out[clean] = d
+        plate = extract_plate_from_name(name)
+        if plate:
+            out[plate] = d
     return out
 
 
@@ -958,7 +995,6 @@ def generar_reporte_horario(vehicles):
         else:
             parados_count += 1
 
-    # Si no hay ningún vehículo moviéndose, no mandamos reporte
     if not en_movimiento:
         return None
 
@@ -1212,7 +1248,7 @@ def main():
     last_summary_date   = None
     last_cierre_18_date = None
 
-    print("\nAgente RutaSat v1.5 corriendo")
+    print("\nAgente RutaSat v1.6 corriendo")
     print(f"  Poll: {POLL_SECONDS}s | Ruta: {LIMITE_RUTA}km/h | Urbano: {LIMITE_URBANO}km/h | Ruta-110: 110km/h")
     if PATENTES_110:
         print(f"  Vehiculos 110km/h - Patentes: {', '.join(sorted(PATENTES_110))}")
@@ -1308,7 +1344,8 @@ def main():
                                     f"🚨 Uso fuera de horario\n"
                                     f"· {dname}\n"
                                     f"· Hora: {hora_local.strftime('%H:%M')}\n"
-                                    f"· Velocidad: {speed:.0f} km/h"
+                                    f"· Velocidad: {speed:.0f} km/h\n"
+                                    f"· Ubic.: {format_coords(lat, lng)}"
                                 )
                                 send_to_admins(twilio, after_msg)
                                 print(f"  USO FUERA DE HORARIO: {dname} a {speed:.0f} km/h")
