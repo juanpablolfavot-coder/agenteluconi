@@ -257,7 +257,6 @@ def maps_link(lat, lng):
 def format_coords(lat, lng):
     return f"{float(lat):.5f}, {float(lng):.5f}"
 
-def):.5f}"
 
 def knots_to_kmh(knots):
     """RutaSat devuelve velocidad en nudos."""
