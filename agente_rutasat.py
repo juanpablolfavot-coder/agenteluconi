@@ -51,10 +51,10 @@ SPEED_EXCEED_MINUTES = int(os.getenv("SPEED_EXCEED_MINUTES", "3"))
 STATE_FILE = os.getenv("STATE_FILE", "monitor_state_rutasat.json")
 
 # Clima: cache y backoff para evitar 429
-WEATHER_CACHE_TTL         = int(os.getenv("WEATHER_CACHE_TTL", "1800"))          # 30 min
-WEATHER_BACKOFF_SECONDS   = int(os.getenv("WEATHER_BACKOFF_SECONDS", "900"))     # 15 min
-WEATHER_CACHE_PRECISION   = int(os.getenv("WEATHER_CACHE_PRECISION", "1"))       # 1 decimal ~= 11 km
-WEATHER_REQUEST_TIMEOUT   = int(os.getenv("WEATHER_REQUEST_TIMEOUT", "10"))
+WEATHER_CACHE_TTL       = int(os.getenv("WEATHER_CACHE_TTL", "1800"))        # 30 min
+WEATHER_BACKOFF_SECONDS = int(os.getenv("WEATHER_BACKOFF_SECONDS", "900"))   # 15 min
+WEATHER_CACHE_PRECISION = int(os.getenv("WEATHER_CACHE_PRECISION", "1"))     # 1 decimal
+WEATHER_REQUEST_TIMEOUT = int(os.getenv("WEATHER_REQUEST_TIMEOUT", "10"))
 
 # Zonas urbanas — ajustar segun la empresa
 URBAN_BBOXES = {
@@ -133,16 +133,19 @@ PATENTES_110: set = {
 # MAPA PATENTE → NOMBRE LEGIBLE
 # ---------------------------------------------------------------------------
 NOMBRE_VEHICULO = {
-    "ORF347":  "Kangoo EX.1.6 #1",
-    "ORF342":  "Kangoo EX.1.6 #2",
+    "ORF347":  "Kangoo EX.1.6 #Rio Tercero",
+    "ORF342":  "Kangoo EX.1.6 #Santa Rosa",
     "KCB412":  "Partner 1.6 HDI",
-    "AH516HY": "KWID #1",
-    "AH516HX": "KWID #2",
-    "AG369ZD": "Sandero #1",
-    "AG369ZC": "Sandero #2",
-    "AG677LX": "Sandero #3",
-    "AG677LW": "Sandero #4",
+    "AH516HY": "KWID #Maxi",
+    "AH516HX": "KWID #Ariel",
+    "AG369ZD": "Sandero #Dario",
+    "AG369ZC": "Sandero #Agustin",
+    "AG677LX": "Sandero #Martin",
+    "AG677LW": "Sandero #Jairo",
     "JFV680":  "VW Fox 1.6",
+    "A073EQT": "Ale Brignone",
+    "A161TWU": "Lucas Novareti",
+    "A255DSL": "Valentin Acoto",
 }
 
 # ---------------------------------------------------------------------------
@@ -216,8 +219,8 @@ speed_exceed_tracking     = {}
 after_hours_motion_state  = {}
 last_alert_ts             = {}
 
-weather_cache              = {}
-weather_rate_limited_until = 0
+weather_cache               = {}
+weather_rate_limited_until  = 0
 
 traffic_cache         = {}
 wa_session_active     = {}
