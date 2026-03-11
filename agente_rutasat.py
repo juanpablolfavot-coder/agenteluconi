@@ -47,8 +47,14 @@ AFTER_HOURS_END   = os.getenv("AFTER_HOURS_END", "05:00")
 # Margen seguro para Twilio WhatsApp
 MAX_WA_BODY = int(os.getenv("MAX_WA_BODY", "1300"))
 
-SPEED_EXCEED_MINUTES = 3
+SPEED_EXCEED_MINUTES = int(os.getenv("SPEED_EXCEED_MINUTES", "3"))
 STATE_FILE = os.getenv("STATE_FILE", "monitor_state_rutasat.json")
+
+# Clima: cache y backoff para evitar 429
+WEATHER_CACHE_TTL         = int(os.getenv("WEATHER_CACHE_TTL", "1800"))          # 30 min
+WEATHER_BACKOFF_SECONDS   = int(os.getenv("WEATHER_BACKOFF_SECONDS", "900"))     # 15 min
+WEATHER_CACHE_PRECISION   = int(os.getenv("WEATHER_CACHE_PRECISION", "1"))       # 1 decimal ~= 11 km
+WEATHER_REQUEST_TIMEOUT   = int(os.getenv("WEATHER_REQUEST_TIMEOUT", "10"))
 
 # Zonas urbanas — ajustar segun la empresa
 URBAN_BBOXES = {
@@ -208,8 +214,11 @@ idle_tracking             = {}
 idle_alerted              = {}
 speed_exceed_tracking     = {}
 after_hours_motion_state  = {}
+last_alert_ts             = {}
 
-weather_cache         = {}
+weather_cache              = {}
+weather_rate_limited_until = 0
+
 traffic_cache         = {}
 wa_session_active     = {}
 
@@ -641,22 +650,49 @@ def log_event(row, path="logs_alertas_rutasat.csv"):
 # ---------------------------------------------------------------------------
 # CLIMA (Open-Meteo — gratis, sin API key)
 # ---------------------------------------------------------------------------
+def _weather_cache_key(lat, lng):
+    lat_r = round(float(lat), WEATHER_CACHE_PRECISION)
+    lng_r = round(float(lng), WEATHER_CACHE_PRECISION)
+    fmt = f"{{:.{WEATHER_CACHE_PRECISION}f}},{{:.{WEATHER_CACHE_PRECISION}f}}"
+    return fmt.format(lat_r, lng_r), lat_r, lng_r
+
+
 def get_weather(lat, lng):
-    cache_key = f"{lat:.2f},{lng:.2f}"
-    ahora     = time.time()
-    if cache_key in weather_cache and (ahora - weather_cache[cache_key]["ts"]) < 3600:
-        return weather_cache[cache_key]["data"]
+    global weather_rate_limited_until
+
+    cache_key, lat_q, lng_q = _weather_cache_key(lat, lng)
+    ahora = time.time()
+    cached = weather_cache.get(cache_key)
+
+    if cached and (ahora - cached["ts"]) < WEATHER_CACHE_TTL:
+        return cached["data"]
+
+    if ahora < weather_rate_limited_until:
+        if cached:
+            return cached["data"]
+        return None
+
     try:
-        url = (
-            "https://api.open-meteo.com/v1/forecast"
-            f"?latitude={lat}&longitude={lng}"
-            "&current=temperature_2m,apparent_temperature,precipitation,"
-            "rain,weather_code,wind_speed_10m,wind_gusts_10m"
-            "&timezone=America/Argentina/Cordoba"
-        )
-        r = requests.get(url, timeout=10)
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": lat_q,
+            "longitude": lng_q,
+            "current": "temperature_2m,apparent_temperature,precipitation,rain,weather_code,wind_speed_10m,wind_gusts_10m",
+            "timezone": "America/Argentina/Cordoba",
+        }
+        r = requests.get(url, params=params, timeout=WEATHER_REQUEST_TIMEOUT)
+
+        if r.status_code == 429:
+            weather_rate_limited_until = ahora + WEATHER_BACKOFF_SECONDS
+            if cached:
+                print("  Clima: 429, usando cache anterior")
+                return cached["data"]
+            print(f"  Error clima: 429 Too Many Requests. Backoff {WEATHER_BACKOFF_SECONDS}s")
+            return None
+
         r.raise_for_status()
         data = r.json().get("current", {})
+
         info = {
             "temp":          data.get("temperature_2m"),
             "feels_like":    data.get("apparent_temperature"),
@@ -669,7 +705,11 @@ def get_weather(lat, lng):
         }
         weather_cache[cache_key] = {"ts": ahora, "data": info}
         return info
+
     except Exception as e:
+        if cached:
+            print(f"  Error clima: {e} | usando cache anterior")
+            return cached["data"]
         print(f"  Error clima: {e}")
         return None
 
@@ -694,11 +734,11 @@ def format_weather_short(w):
     wind  = w.get("wind_speed", 0) or 0
     gusts = w.get("wind_gusts", 0) or 0
     rain  = w.get("rain", 0) or 0
-    if wind  > 20:
+    if wind > 20:
         msg += f", viento {wind:.0f}km/h"
     if gusts > 40:
         msg += f" (rafagas {gusts:.0f})"
-    if rain  > 0:
+    if rain > 0:
         msg += f", lluvia {rain:.1f}mm"
     return msg
 
@@ -833,21 +873,23 @@ def init_claude():
         print("  Sin ANTHROPIC_API_KEY -- modo basico")
 
 
-def ia_generar_alerta(plate, speed, limit, zone, lat=None, lng=None):
+def ia_generar_alerta(plate, speed, limit, zone, lat=None, lng=None, raw_name=None):
+    plate_clean   = normalize_plate(plate)
+    vehicle_label = display_name(plate_clean, raw_name)
     exceso = speed - limit
 
     if not claude_client:
         return {
-            "admin":    f"{plate}: {speed:.0f} km/h (lim {limit:.0f}) -- {zone}.",
+            "admin":    f"{vehicle_label}: {speed:.0f} km/h (lim {limit:.0f}) -- {zone}.",
             "severity": "media",
         }
 
-    historial   = alert_history.get(plate, [])
+    historial   = alert_history.get(plate_clean, [])
     hoy_str     = now_local().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     alertas_hoy = [a for a in historial if a["ts"] > hoy_str]
 
     clima_ctx = ""
-    if lat and lng:
+    if lat is not None and lng is not None:
         w = get_weather(lat, lng)
         if w:
             risky, risk_text = is_weather_risky(w)
@@ -855,13 +897,14 @@ def ia_generar_alerta(plate, speed, limit, zone, lat=None, lng=None):
                 clima_ctx += f"\n- CLIMA: {risk_text}"
 
     trafico_ctx = ""
-    if lat and lng and TOMTOM_API_KEY:
+    if lat is not None and lng is not None and TOMTOM_API_KEY:
         incidents = get_traffic_incidents(lat, lng)
         if incidents and has_significant_traffic(incidents):
             trafico_ctx = f"\n- TRAFICO: {format_traffic_short(incidents)}"
 
     prompt = f"""Genera alerta de velocidad:
-- Patente: {plate}
+- Vehiculo: {vehicle_label}
+- Patente: {plate_clean}
 - Velocidad: {speed:.0f} km/h | Limite: {limit:.0f} km/h | Exceso: {exceso:.0f} km/h
 - Zona: {zone} | Alertas hoy: {len(alertas_hoy)}{clima_ctx}{trafico_ctx}
 
@@ -879,7 +922,7 @@ Responde SOLO con JSON: {{"admin": "...", "severity": "baja|media|alta"}}"""
         return json.loads(text)
     except Exception as e:
         print(f"  IA alerta error: {e}")
-        return {"admin": f"{plate}: {speed:.0f} km/h (lim {limit:.0f}) -- {zone}.", "severity": "media"}
+        return {"admin": f"{vehicle_label}: {speed:.0f} km/h (lim {limit:.0f}) -- {zone}.", "severity": "media"}
 
 
 def ia_resumen_diario():
@@ -1324,6 +1367,8 @@ def main():
     print(f"  Uso fuera de horario: {AFTER_HOURS_START} a {AFTER_HOURS_END}")
     print(f"  Ralenti excluido para: {', '.join(sorted(RALENTI_EXCLUIDOS_MATCH))}")
     print(f"  Estado persistente: {STATE_FILE}")
+    print(f"  Exceso de velocidad sostenido: {SPEED_EXCEED_MINUTES} min")
+    print(f"  Clima cache TTL: {WEATHER_CACHE_TTL}s | backoff 429: {WEATHER_BACKOFF_SECONDS}s")
     print()
 
     global last_hourly_report
@@ -1481,21 +1526,45 @@ def main():
                         speed_exceed_tracking.pop(plate, None)
                         continue
 
+                    track = speed_exceed_tracking.get(plate)
+                    if not track:
+                        speed_exceed_tracking[plate] = {
+                            "since": ahora_ts,
+                            "max_speed": speed,
+                        }
+                        continue
+
+                    if speed > track["max_speed"]:
+                        track["max_speed"] = speed
+
+                    if (ahora_ts - track["since"]) < (SPEED_EXCEED_MINUTES * 60):
+                        continue
+
                     if ahora_ts - last_alert_ts.get(plate, 0) < 300:
                         continue
 
                     last_alert_ts[plate] = ahora_ts
 
-                    print(f"  {dname} -> {speed:.0f} km/h (lim {limit}, {zone})")
-                    mensajes = ia_generar_alerta(dname, speed, limit, zone, lat, lng)
+                    speed_alert = max(speed, track.get("max_speed", speed))
+
+                    print(f"  {dname} -> {speed_alert:.0f} km/h (lim {limit}, {zone})")
+                    mensajes = ia_generar_alerta(
+                        plate,
+                        speed_alert,
+                        limit,
+                        zone,
+                        lat,
+                        lng,
+                        raw_name=v.get("name"),
+                    )
 
                     # SIN Maps para evitar spam / mensajes partidos
                     send_to_admins(twilio, mensajes["admin"])
 
-                    alert_history.setdefault(plate, []).append({"ts": now_iso(), "speed": speed})
+                    alert_history.setdefault(plate, []).append({"ts": now_iso(), "speed": speed_alert})
                     daily_events.append({
                         "vehicle_key": plate,
-                        "speed": speed,
+                        "speed": speed_alert,
                         "limit": limit,
                         "zone": zone,
                         "severity": mensajes.get("severity", "media"),
@@ -1505,7 +1574,7 @@ def main():
                         "ts": ahora_ts,
                         "vehicle_key": plate,
                         "type": "velocidad",
-                        "speed": f"{speed:.1f}",
+                        "speed": f"{speed_alert:.1f}",
                         "limit": limit,
                         "zone": zone,
                     })
