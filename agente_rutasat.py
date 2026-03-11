@@ -1,75 +1,79 @@
 from utils_env import load_env
 load_env(".envvars")
 
-import time
 import csv
-import os
 import json
+import os
 import re
+import time
 import traceback
-import requests
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
-from twilio.rest import Client
 import anthropic
+import requests
+from twilio.rest import Client
 
 
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-RUTASAT_BASE_URL  = "https://rutasat.com/api"
-RUTASAT_EMAIL     = os.getenv("RUTASAT_EMAIL", "")
-RUTASAT_PASSWORD  = os.getenv("RUTASAT_PASSWORD", "")
+RUTASAT_BASE_URL = "https://rutasat.com/api"
+RUTASAT_EMAIL = os.getenv("RUTASAT_EMAIL", "")
+RUTASAT_PASSWORD = os.getenv("RUTASAT_PASSWORD", "")
 
-TWILIO_ACCOUNT_SID   = os.getenv("TWILIO_ACCOUNT_SID", "")
-TWILIO_AUTH_TOKEN    = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")
-TWILIO_CONTENT_SID   = os.getenv("TWILIO_CONTENT_SID", "")
+TWILIO_CONTENT_SID = os.getenv("TWILIO_CONTENT_SID", "")
 
-ADMIN_WHATSAPP  = os.getenv("ADMIN_WHATSAPP", "")
+ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "")
 ADMIN2_WHATSAPP = os.getenv("ADMIN2_WHATSAPP", "")
 ADMIN3_WHATSAPP = os.getenv("ADMIN3_WHATSAPP", "")
 ADMIN4_WHATSAPP = os.getenv("ADMIN4_WHATSAPP", "")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-TOMTOM_API_KEY    = os.getenv("TOMTOM_API_KEY", "")
+TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY", "")
 
-POLL_SECONDS       = int(os.getenv("POLL_SECONDS", "120"))
-LIMITE_RUTA        = int(os.getenv("LIMITE_RUTA", "80"))
-LIMITE_URBANO      = int(os.getenv("LIMITE_URBANO", "60"))
-IDLE_MINUTES       = int(os.getenv("IDLE_MINUTES", "5"))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
+LIMITE_RUTA = int(os.getenv("LIMITE_RUTA", "80"))
+LIMITE_URBANO = int(os.getenv("LIMITE_URBANO", "60"))
+IDLE_MINUTES = int(os.getenv("IDLE_MINUTES", "5"))
 MOVEMENT_MIN_SPEED = int(os.getenv("MOVEMENT_MIN_SPEED", "5"))
 
-# Ventana fuera de horario
 AFTER_HOURS_START = os.getenv("AFTER_HOURS_START", "20:30")
-AFTER_HOURS_END   = os.getenv("AFTER_HOURS_END", "05:00")
+AFTER_HOURS_END = os.getenv("AFTER_HOURS_END", "05:00")
 
-# Margen seguro para Twilio WhatsApp
 MAX_WA_BODY = int(os.getenv("MAX_WA_BODY", "1300"))
-
 SPEED_EXCEED_MINUTES = int(os.getenv("SPEED_EXCEED_MINUTES", "3"))
 STATE_FILE = os.getenv("STATE_FILE", "monitor_state_rutasat.json")
 
-# Clima: cache y backoff para evitar 429
-WEATHER_CACHE_TTL       = int(os.getenv("WEATHER_CACHE_TTL", "1800"))        # 30 min
-WEATHER_BACKOFF_SECONDS = int(os.getenv("WEATHER_BACKOFF_SECONDS", "900"))   # 15 min
-WEATHER_CACHE_PRECISION = int(os.getenv("WEATHER_CACHE_PRECISION", "1"))     # 1 decimal
+WEATHER_CACHE_TTL = int(os.getenv("WEATHER_CACHE_TTL", "1800"))
+WEATHER_BACKOFF_SECONDS = int(os.getenv("WEATHER_BACKOFF_SECONDS", "900"))
+WEATHER_CACHE_PRECISION = int(os.getenv("WEATHER_CACHE_PRECISION", "1"))
 WEATHER_REQUEST_TIMEOUT = int(os.getenv("WEATHER_REQUEST_TIMEOUT", "10"))
 
-# Anti-datos viejos / GPS colgado
 STALE_POSITION_MINUTES = int(os.getenv("STALE_POSITION_MINUTES", "10"))
 
-# Zonas urbanas — ajustar segun la empresa
+LOG_PATH = os.getenv("LOG_PATH", "logs_alertas_rutasat.csv")
+LOG_FIELDNAMES = [
+    "ts",
+    "vehicle_key",
+    "device_id",
+    "type",
+    "minutes",
+    "speed",
+    "limit",
+    "zone",
+]
+
 URBAN_BBOXES = {
     "RIO_TERCERO": (-32.20, -64.14, -32.12, -64.05),
-    "CORDOBA":     (-31.47, -64.26, -31.33, -64.10),
-    "CABA":        (-34.71, -58.53, -34.53, -58.33),
+    "CORDOBA": (-31.47, -64.26, -31.33, -64.10),
+    "CABA": (-34.71, -58.53, -34.53, -58.33),
 }
 
-# Nombres de dispositivos a ignorar (mayusculas normalizadas)
 DISPOSITIVOS_EXCLUIDOS: set = set()
 
-# Excluir ralenti solo para esta unidad
 RALENTI_EXCLUIDOS_MATCH: set = {
     "A241VOY",
 }
@@ -83,21 +87,12 @@ def normalize_plate(text):
 
 
 def extract_plate_from_name(text):
-    """
-    Extrae patente real desde nombres como:
-    - Moto A073EQT ALE BRIGNONE (52)
-    - Kangoo/ORF342 (04)
-    - Iveco 56 AF195QL
-    - Sandero AG677LX(33)
-    - Kwid/AH516HX (54)
-    - Kwid AH516HY (53)
-    """
     raw = (text or "").upper()
 
     patterns = [
-        r"\b([A-Z]{2}\d{3}[A-Z]{2})\b",  # AF195QL / AH516HX / AH516HY
-        r"\b([A-Z]\d{3}[A-Z]{3})\b",     # A073EQT / A241VOY
-        r"\b([A-Z]{3}\d{3})\b",          # ORF347 / JFV680
+        r"\b([A-Z]{2}\d{3}[A-Z]{2})\b",
+        r"\b([A-Z]\d{3}[A-Z]{3})\b",
+        r"\b([A-Z]{3}\d{3})\b",
     ]
 
     for pat in patterns:
@@ -107,11 +102,13 @@ def extract_plate_from_name(text):
 
     compact = re.sub(r"[^A-Z0-9]", "", raw)
 
-    for pat in [
+    compact_patterns = [
         r"([A-Z]{2}\d{3}[A-Z]{2})",
         r"([A-Z]\d{3}[A-Z]{3})",
         r"([A-Z]{3}\d{3})",
-    ]:
+    ]
+
+    for pat in compact_patterns:
         m = re.search(pat, compact)
         if m:
             return m.group(1)
@@ -119,43 +116,30 @@ def extract_plate_from_name(text):
     return ""
 
 
-# ---------------------------------------------------------------------------
-# VEHÍCULOS CON LÍMITE 110 km/h (autopista / ruta nacional)
-# SOLO por patente, en MAYÚSCULAS y sin espacios ni guiones
-# ---------------------------------------------------------------------------
 PATENTES_110: set = {
-    # Kangoo
     "ORF347", "ORF342",
-    # KWID
     "AH516HY", "AH516HX",
-    # Sandero
     "AG369ZD", "AG369ZC", "AG677LX", "AG677LW",
 }
 
-# ---------------------------------------------------------------------------
-# MAPA PATENTE → NOMBRE LEGIBLE
-# ---------------------------------------------------------------------------
 NOMBRE_VEHICULO = {
-    "ORF347":  "Kangoo EX.1.6 #Santa Rosa Colon",
-    "ORF342":  "Kangoo EX.1.6 #Rio Tercero",
-    "KCB412":  "Partner 1.6 HDI",
+    "ORF347": "Kangoo EX.1.6 #Santa Rosa Colon",
+    "ORF342": "Kangoo EX.1.6 #Rio Tercero",
+    "KCB412": "Partner 1.6 HDI",
     "AH516HY": "KWID #Maxi",
     "AH516HX": "KWID #Ariel",
     "AG369ZD": "Sandero #Dario",
     "AG369ZC": "Sandero #Agustin",
     "AG677LX": "Sandero #MJairo",
     "AG677LW": "Sandero #Martin",
-    "JFV680":  "VW Fox 1.6 #Malagueño",
+    "JFV680": "VW Fox 1.6 #Malagueño",
     "A073EQT": "Ale Brignone",
     "A161TWU": "Lucas Novareti",
     "A255DSL": "Valentin Acoto",
     "AA706VW": "Murgui",
-    "NWD463":  "Leo Acevedo",
+    "NWD463": "Leo Acevedo",
 }
 
-# ---------------------------------------------------------------------------
-# PATENTES PARA REPORTE DE CIERRE 18HS
-# ---------------------------------------------------------------------------
 PATENTES_REPORTE_18: set = {
     "AH516HY",
     "AH516HX",
@@ -181,9 +165,8 @@ PATENTES_REPORTE_18: set = {
 
 
 def get_speed_limit(vehicle):
-    """Devuelve el límite de velocidad para un vehículo dado."""
-    lat   = vehicle["lat"]
-    lng   = vehicle["lng"]
+    lat = vehicle["lat"]
+    lng = vehicle["lng"]
     plate = normalize_plate(vehicle["plate"])
 
     if is_in_urban(lat, lng):
@@ -196,11 +179,7 @@ def get_speed_limit(vehicle):
 
 
 def display_name(plate, raw_name=None):
-    """
-    Si la patente está mapeada devuelve 'PATENTE (Modelo)'.
-    Si no, usa el nombre real del equipo si existe.
-    """
-    clean  = normalize_plate(plate)
+    clean = normalize_plate(plate)
     nombre = NOMBRE_VEHICULO.get(clean)
     if nombre:
         return f"{clean} ({nombre})"
@@ -216,23 +195,23 @@ def get_admin_numbers():
 # ---------------------------------------------------------------------------
 # ESTADO GLOBAL
 # ---------------------------------------------------------------------------
-alert_history         = {}
-daily_events          = []
-last_hourly_report    = 0
+alert_history = {}
+daily_events = []
+last_hourly_report = 0
 
-idle_tracking             = {}
-idle_alerted              = {}
-speed_exceed_tracking     = {}
-after_hours_motion_state  = {}
-last_alert_ts             = {}
+idle_tracking = {}
+idle_alerted = {}
+speed_exceed_tracking = {}
+after_hours_motion_state = {}
+last_alert_ts = {}
 
-weather_cache               = {}
-weather_rate_limited_until  = 0
+weather_cache = {}
+weather_rate_limited_until = 0
 
-traffic_cache         = {}
-wa_session_active     = {}
+traffic_cache = {}
+wa_session_active = {}
 
-_rutasat_token        = None
+_rutasat_token = None
 _rutasat_token_expiry = 0
 
 
@@ -292,16 +271,11 @@ def is_in_urban(lat, lng):
     return False
 
 
-def maps_link(lat, lng):
-    return f"https://maps.google.com/?q={lat},{lng}"
-
-
 def format_coords(lat, lng):
     return f"{float(lat):.5f}, {float(lng):.5f}"
 
 
 def knots_to_kmh(knots):
-    """RutaSat devuelve velocidad en nudos."""
     return float(knots or 0) * 1.852
 
 
@@ -338,10 +312,6 @@ def parse_hhmm(text, default=(20, 30)):
 
 
 def to_bool(value):
-    """
-    Convierte correctamente valores típicos de APIs:
-    True/False, 1/0, "true"/"false", "on"/"off", etc.
-    """
     if isinstance(value, bool):
         return value
     if value is None:
@@ -355,13 +325,6 @@ def to_bool(value):
 
 
 def extract_position_timestamp(pos):
-    """
-    Toma el mejor timestamp disponible de la posición.
-    Prioridad:
-    - fixTime
-    - deviceTime
-    - serverTime
-    """
     for key in ("fixTime", "deviceTime", "serverTime"):
         value = pos.get(key)
         dt = parse_dt_local(value)
@@ -378,20 +341,46 @@ def is_position_stale(last_update, max_age_minutes=STALE_POSITION_MINUTES):
     return age.total_seconds() > (max_age_minutes * 60)
 
 
+def vehicle_state_key(vehicle):
+    device_id = vehicle.get("device_id")
+    if device_id is not None and str(device_id).strip():
+        return str(device_id).strip()
+
+    plate = normalize_plate(vehicle.get("plate", ""))
+    if plate:
+        return plate
+
+    name = normalize_plate(vehicle.get("name", ""))
+    if name:
+        return name
+
+    return "unknown"
+
+
+def cleanup_missing_vehicle_states(active_keys):
+    stores = (
+        idle_tracking,
+        idle_alerted,
+        speed_exceed_tracking,
+        after_hours_motion_state,
+        last_alert_ts,
+    )
+    for store in stores:
+        for key in list(store.keys()):
+            if key not in active_keys:
+                store.pop(key, None)
+
+
 AFTER_HOURS_START_HM = parse_hhmm(AFTER_HOURS_START, (20, 30))
-AFTER_HOURS_END_HM   = parse_hhmm(AFTER_HOURS_END,   (5, 0))
+AFTER_HOURS_END_HM = parse_hhmm(AFTER_HOURS_END, (5, 0))
 
 
 def is_after_hours(dt=None):
-    """
-    Ventana fuera de horario.
-    Por defecto: desde 20:30 hasta 05:00 del día siguiente.
-    """
     dt = dt or now_local()
     hm = (dt.hour, dt.minute)
 
     start = AFTER_HOURS_START_HM
-    end   = AFTER_HOURS_END_HM
+    end = AFTER_HOURS_END_HM
 
     if start <= end:
         return start <= hm < end
@@ -400,12 +389,8 @@ def is_after_hours(dt=None):
 
 
 def is_idle_excluded(vehicle):
-    """
-    Excluye de alerta de ralenti SOLO a la unidad Motomel gris A241VOY (46).
-    Busca por coincidencia para tolerar distintos formatos de nombre.
-    """
     plate_txt = normalize_plate(vehicle.get("plate", ""))
-    name_txt  = normalize_plate(vehicle.get("name", ""))
+    name_txt = normalize_plate(vehicle.get("name", ""))
 
     for token in RALENTI_EXCLUIDOS_MATCH:
         token_norm = normalize_plate(token)
@@ -415,10 +400,6 @@ def is_idle_excluded(vehicle):
 
 
 def split_whatsapp_text(text, limit=MAX_WA_BODY):
-    """
-    Parte un mensaje largo en bloques seguros para Twilio.
-    Prioriza cortes por salto de linea o espacio.
-    """
     text = (text or "").strip()
     if not text:
         return []
@@ -430,11 +411,7 @@ def split_whatsapp_text(text, limit=MAX_WA_BODY):
 
     for raw_line in text.splitlines():
         line = raw_line.rstrip()
-
-        if not current:
-            candidate = line
-        else:
-            candidate = current + "\n" + line
+        candidate = line if not current else current + "\n" + line
 
         if len(candidate) <= hard_limit:
             current = candidate
@@ -468,6 +445,7 @@ def split_whatsapp_text(text, limit=MAX_WA_BODY):
 # ---------------------------------------------------------------------------
 def get_rutasat_token():
     global _rutasat_token, _rutasat_token_expiry
+
     ahora = time.time()
     if _rutasat_token and ahora < _rutasat_token_expiry:
         return _rutasat_token
@@ -489,8 +467,9 @@ def get_rutasat_token():
     )
     r2.raise_for_status()
 
-    _rutasat_token        = r2.text.strip()
+    _rutasat_token = r2.text.strip()
     _rutasat_token_expiry = ahora + (29 * 86400)
+
     print("  RutaSat token OK (expira en 30 dias)")
     return _rutasat_token
 
@@ -512,13 +491,6 @@ def get_positions():
 
 
 def _extract_report_rows(data):
-    """
-    Normaliza distintas respuestas posibles de RutaSat:
-    - lista directa
-    - dict con 'data'
-    - dict con 'items'
-    - dict con 'result'
-    """
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
@@ -529,10 +501,6 @@ def _extract_report_rows(data):
 
 
 def get_report_trips(device_id, from_dt, to_dt):
-    """
-    Historial de viajes del vehículo dentro del rango.
-    Si tu cuenta usa otro endpoint, ajustá SOLO esta función.
-    """
     try:
         data = rutasat_get(
             "/reports/trips",
@@ -549,10 +517,6 @@ def get_report_trips(device_id, from_dt, to_dt):
 
 
 def get_report_stops(device_id, from_dt, to_dt):
-    """
-    Historial de paradas del vehículo dentro del rango.
-    Si tu cuenta usa otro endpoint, ajustá SOLO esta función.
-    """
     try:
         data = rutasat_get(
             "/reports/stops",
@@ -570,12 +534,12 @@ def get_report_stops(device_id, from_dt, to_dt):
 
 def build_vehicle_list(devices, positions):
     device_map = {d["id"]: d for d in devices}
-    vehicles   = []
+    vehicles = []
 
     for pos in positions:
         device_id = pos.get("deviceId")
-        device    = device_map.get(device_id, {})
-        name      = (device.get("name", str(device_id)) or "").strip()
+        device = device_map.get(device_id, {})
+        name = (device.get("name", str(device_id)) or "").strip()
 
         plate = extract_plate_from_name(name)
         if not plate:
@@ -585,24 +549,20 @@ def build_vehicle_list(devices, positions):
             continue
 
         attrs = pos.get("attributes", {}) or {}
-
-        ignition_raw = (
-            attrs.get("ignition")
-            if "ignition" in attrs else
-            attrs.get("ignitionOn")
-        )
+        ignition_raw = attrs.get("ignition") if "ignition" in attrs else attrs.get("ignitionOn")
         ignition = to_bool(ignition_raw)
 
         vehicles.append({
-            "plate":       plate,
-            "device_id":   device_id,
-            "name":        name,
-            "lat":         float(pos.get("latitude",  0) or 0),
-            "lng":         float(pos.get("longitude", 0) or 0),
-            "speed_kmh":   knots_to_kmh(pos.get("speed", 0)),
-            "ignition":    ignition,
+            "plate": plate,
+            "device_id": device_id,
+            "name": name,
+            "lat": float(pos.get("latitude", 0) or 0),
+            "lng": float(pos.get("longitude", 0) or 0),
+            "speed_kmh": knots_to_kmh(pos.get("speed", 0)),
+            "ignition": ignition,
             "last_update": extract_position_timestamp(pos),
         })
+
     return vehicles
 
 
@@ -620,11 +580,6 @@ def build_devices_lookup_by_plate(devices):
 # WHATSAPP (Twilio)
 # ---------------------------------------------------------------------------
 def _send_single_whatsapp(client, to, body, has_session):
-    """
-    Envia un solo bloque de mensaje.
-    Si hay ventana activa de 24h intenta body directo.
-    Si no, intenta template si existe.
-    """
     if has_session:
         try:
             return client.messages.create(
@@ -664,7 +619,7 @@ def send_whatsapp(client, to, body):
     if not body:
         return []
 
-    ahora       = time.time()
+    ahora = time.time()
     has_session = (ahora - wa_session_active.get(to, 0)) < 86400
 
     partes = split_whatsapp_text(body, MAX_WA_BODY)
@@ -695,13 +650,15 @@ def send_to_admins(client, body):
 # ---------------------------------------------------------------------------
 # LOG CSV
 # ---------------------------------------------------------------------------
-def log_event(row, path="logs_alertas_rutasat.csv"):
+def log_event(row, path=LOG_PATH):
     exists = os.path.exists(path)
+    payload = {key: row.get(key, "") for key in LOG_FIELDNAMES}
+
     with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        writer = csv.DictWriter(f, fieldnames=LOG_FIELDNAMES, extrasaction="ignore")
         if not exists:
             writer.writeheader()
-        writer.writerow(row)
+        writer.writerow(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -751,14 +708,14 @@ def get_weather(lat, lng):
         data = r.json().get("current", {})
 
         info = {
-            "temp":          data.get("temperature_2m"),
-            "feels_like":    data.get("apparent_temperature"),
+            "temp": data.get("temperature_2m"),
+            "feels_like": data.get("apparent_temperature"),
             "precipitation": data.get("precipitation", 0),
-            "rain":          data.get("rain", 0),
-            "wind_speed":    data.get("wind_speed_10m"),
-            "wind_gusts":    data.get("wind_gusts_10m"),
-            "weather_code":  data.get("weather_code", 0),
-            "description":   _wcode(data.get("weather_code", 0)),
+            "rain": data.get("rain", 0),
+            "wind_speed": data.get("wind_speed_10m"),
+            "wind_gusts": data.get("wind_gusts_10m"),
+            "weather_code": data.get("weather_code", 0),
+            "description": _wcode(data.get("weather_code", 0)),
         }
         weather_cache[cache_key] = {"ts": ahora, "data": info}
         return info
@@ -787,36 +744,45 @@ def _wcode(code):
 def format_weather_short(w):
     if not w:
         return "sin datos"
-    msg   = f"{w.get('description','?')}, {w.get('temp','?')}C (ST {w.get('feels_like','?')}C)"
-    wind  = w.get("wind_speed", 0) or 0
+
+    msg = f"{w.get('description', '?')}, {w.get('temp', '?')}C (ST {w.get('feels_like', '?')}C)"
+    wind = w.get("wind_speed", 0) or 0
     gusts = w.get("wind_gusts", 0) or 0
-    rain  = w.get("rain", 0) or 0
+    rain = w.get("rain", 0) or 0
+
     if wind > 20:
         msg += f", viento {wind:.0f}km/h"
     if gusts > 40:
         msg += f" (rafagas {gusts:.0f})"
     if rain > 0:
         msg += f", lluvia {rain:.1f}mm"
+
     return msg
 
 
 def is_weather_risky(w):
     if not w:
         return False, ""
+
     risks = []
-    code  = w.get("weather_code", 0)
+    code = w.get("weather_code", 0)
     gusts = w.get("wind_gusts", 0) or 0
-    rain  = w.get("rain", 0) or 0
+    rain = w.get("rain", 0) or 0
+
     if code >= 61:
         risks.append("lluvia/tormenta")
     elif code >= 51:
         risks.append("llovizna")
+
     if code in (45, 48):
         risks.append("niebla")
+
     if gusts > 60:
         risks.append(f"rafagas {gusts:.0f}km/h")
+
     if rain > 5:
         risks.append(f"lluvia {rain:.1f}mm")
+
     return bool(risks), ", ".join(risks)
 
 
@@ -828,38 +794,41 @@ def get_traffic_incidents(lat, lng, radius_km=5):
         return None
 
     cache_key = f"{lat:.2f},{lng:.2f}"
-    ahora     = time.time()
+    ahora = time.time()
+
     if cache_key in traffic_cache and (ahora - traffic_cache[cache_key]["ts"]) < 600:
         return traffic_cache[cache_key]["data"]
 
     try:
         delta = radius_km / 111.0
-        bbox  = f"{lng-delta:.4f},{lat-delta:.4f},{lng+delta:.4f},{lat+delta:.4f}"
-        url   = "https://api.tomtom.com/traffic/services/5/incidentDetails"
+        bbox = f"{lng-delta:.4f},{lat-delta:.4f},{lng+delta:.4f},{lat+delta:.4f}"
+        url = "https://api.tomtom.com/traffic/services/5/incidentDetails"
         params = {
-            "key":      TOMTOM_API_KEY,
-            "bbox":     bbox,
-            "fields":   "{incidents{type,geometry{type,coordinates},properties{iconCategory,magnitudeOfDelay,events{description,code},from,to,length,delay,roadNumbers}}}",
+            "key": TOMTOM_API_KEY,
+            "bbox": bbox,
+            "fields": "{incidents{type,geometry{type,coordinates},properties{iconCategory,magnitudeOfDelay,events{description,code},from,to,length,delay,roadNumbers}}}",
             "language": "es-ES",
         }
+
         r = requests.get(url, params=params, timeout=10)
         if r.status_code == 400:
             params.pop("fields", None)
             r = requests.get(url, params=params, timeout=10)
+
         r.raise_for_status()
         data = r.json()
 
         incidents = []
         for inc in data.get("incidents", []):
             props = inc.get("properties", {})
-            icon  = props.get("iconCategory", 0)
+            icon = props.get("iconCategory", 0)
             incidents.append({
-                "category":  _tomtom_cat(icon),
-                "icon":      icon,
-                "from":      props.get("from", ""),
-                "delay":     props.get("delay") or 0,
+                "category": _tomtom_cat(icon),
+                "icon": icon,
+                "from": props.get("from", ""),
+                "delay": props.get("delay") or 0,
                 "magnitude": props.get("magnitudeOfDelay", 0),
-                "events":    [e.get("description", "") for e in props.get("events", []) if e.get("description")],
+                "events": [e.get("description", "") for e in props.get("events", []) if e.get("description")],
             })
 
         traffic_cache[cache_key] = {"ts": ahora, "data": incidents}
@@ -882,24 +851,28 @@ def _tomtom_cat(icon):
 def format_traffic_short(incidents):
     if not incidents:
         return ""
+
     by_cat = {}
     for inc in incidents:
         by_cat.setdefault(inc["category"], []).append(inc)
+
     lines = []
     for cat, incs in by_cat.items():
         total_delay = sum(i.get("delay") or 0 for i in incs)
         detail = f" ({len(incs)} incidentes)" if len(incs) > 1 else ""
         if total_delay > 120:
-            detail += f" ~{total_delay//60}min demora"
+            detail += f" ~{total_delay // 60}min demora"
         elif incs[0].get("from"):
             detail += f" en {incs[0]['from']}"
         lines.append(f"- {cat}{detail}")
+
     return "\n".join(lines[:5])
 
 
 def has_significant_traffic(incidents):
     if not incidents:
         return False
+
     for inc in incidents:
         if inc.get("icon") in (1, 8, 11, 14):
             return True
@@ -907,6 +880,7 @@ def has_significant_traffic(incidents):
             return True
         if inc.get("magnitude", 0) >= 3:
             return True
+
     return False
 
 
@@ -923,6 +897,7 @@ REGLA CRITICA: si te pasan alertas acumuladas del dia, SIEMPRE incluirlas. NUNCA
 
 def init_claude():
     global claude_client
+
     if ANTHROPIC_API_KEY:
         claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=30.0)
         print("  Claude IA conectado")
@@ -931,18 +906,18 @@ def init_claude():
 
 
 def ia_generar_alerta(plate, speed, limit, zone, lat=None, lng=None, raw_name=None):
-    plate_clean   = normalize_plate(plate)
+    plate_clean = normalize_plate(plate)
     vehicle_label = display_name(plate_clean, raw_name)
     exceso = speed - limit
 
     if not claude_client:
         return {
-            "admin":    f"{vehicle_label}: {speed:.0f} km/h (lim {limit:.0f}) -- {zone}.",
+            "admin": f"{vehicle_label}: {speed:.0f} km/h (lim {limit:.0f}) -- {zone}.",
             "severity": "media",
         }
 
-    historial   = alert_history.get(plate_clean, [])
-    hoy_str     = now_local().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    historial = alert_history.get(plate_clean, [])
+    hoy_str = now_local().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     alertas_hoy = [a for a in historial if a["ts"] > hoy_str]
 
     clima_ctx = ""
@@ -979,12 +954,16 @@ Responde SOLO con JSON: {{"admin": "...", "severity": "baja|media|alta"}}"""
         return json.loads(text)
     except Exception as e:
         print(f"  IA alerta error: {e}")
-        return {"admin": f"{vehicle_label}: {speed:.0f} km/h (lim {limit:.0f}) -- {zone}.", "severity": "media"}
+        return {
+            "admin": f"{vehicle_label}: {speed:.0f} km/h (lim {limit:.0f}) -- {zone}.",
+            "severity": "media",
+        }
 
 
 def ia_resumen_diario():
     if not daily_events:
         return "Sin eventos hoy. Todo tranquilo."
+
     if not claude_client:
         return f"Resumen: {len(daily_events)} alertas hoy."
 
@@ -1036,24 +1015,24 @@ def _construir_bloque_alertas(alertas_por_patente, hora):
 
 def _leer_alertas_csv_hoy():
     alertas_por_patente = {}
-    hoy      = now_local().date()
+    hoy = now_local().date()
     tz_local = timezone(timedelta(hours=-3))
 
-    if not os.path.exists("logs_alertas_rutasat.csv"):
+    if not os.path.exists(LOG_PATH):
         return alertas_por_patente
 
     try:
-        with open("logs_alertas_rutasat.csv", "r", encoding="utf-8") as f:
+        with open(LOG_PATH, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
                     if row.get("type") == "ralenti":
                         continue
+
                     ts_raw = row.get("ts", "")
                     if not ts_raw:
                         continue
 
-                    ev_dt = None
                     try:
                         ev_dt = datetime.fromtimestamp(float(ts_raw), tz=tz_local)
                     except Exception:
@@ -1077,7 +1056,7 @@ def _leer_alertas_csv_hoy():
                     spd = float(row.get("speed", 0) or 0)
                     if spd > alertas_por_patente[p]["max_vel"]:
                         alertas_por_patente[p]["max_vel"] = spd
-                        alertas_por_patente[p]["hora"]    = ev_dt.strftime("%H:%M")
+                        alertas_por_patente[p]["hora"] = ev_dt.strftime("%H:%M")
                 except Exception:
                     continue
     except Exception as e:
@@ -1093,10 +1072,11 @@ def _get_general_context_for_report(vehicles_in_motion):
     if not vehicles_in_motion:
         return None, ""
 
-    ref           = vehicles_in_motion[0]
-    lat_ref       = ref["lat"]
-    lng_ref       = ref["lng"]
-    w             = get_weather(lat_ref, lng_ref)
+    ref = vehicles_in_motion[0]
+    lat_ref = ref["lat"]
+    lng_ref = ref["lng"]
+
+    w = get_weather(lat_ref, lng_ref)
     clima_general = format_weather_short(w)
 
     trafico_general = ""
@@ -1109,23 +1089,18 @@ def _get_general_context_for_report(vehicles_in_motion):
 
 
 def generar_reporte_horario(vehicles):
-    """
-    Genera reporte SOLO si hay vehículos en movimiento.
-    Muestra SOLO los que están en movimiento.
-    Ubicación como coordenadas, SIN links de Maps.
-    """
-    hora  = now_local().strftime("%H:%M")
+    hora = now_local().strftime("%H:%M")
     fecha = now_local().strftime("%d/%m")
 
     vehicles = [v for v in vehicles if v["plate"] not in DISPOSITIVOS_EXCLUIDOS]
-    total    = len(vehicles)
+    total = len(vehicles)
     ahora_ts = time.time()
 
     en_movimiento = []
     parados_count = 0
 
     for v in vehicles:
-        spd         = v["speed_kmh"]
+        spd = v["speed_kmh"]
         limit, zone = get_speed_limit(v)
 
         if spd > MOVEMENT_MIN_SPEED:
@@ -1141,12 +1116,12 @@ def generar_reporte_horario(vehicles):
         if e.get("type") == "ralenti" and (ahora_ts - e.get("ts", 0)) < 3600
     ]
 
-    alertas_por_patente                 = _leer_alertas_csv_hoy()
+    alertas_por_patente = _leer_alertas_csv_hoy()
     alertas_texto_bloque, total_alertas = _construir_bloque_alertas(alertas_por_patente, hora)
 
     clima_general, trafico_general = _get_general_context_for_report(en_movimiento)
 
-    msg  = f"*🚛 REPORTE FLOTA - {hora}hs ({fecha})*\n\n"
+    msg = f"*🚛 REPORTE FLOTA - {hora}hs ({fecha})*\n\n"
     msg += "*Estado General*\n"
     msg += f"  · Total: {total} | En movimiento: {len(en_movimiento)} | Parados: {parados_count}\n"
     if clima_general:
@@ -1171,11 +1146,7 @@ def generar_reporte_horario(vehicles):
 
 
 def generar_reporte_movimientos_nocturno(vehicles):
-    """
-    Después de las 20:30 reporta únicamente los vehículos que se están moviendo.
-    Más corto que el reporte horario normal.
-    """
-    hora  = now_local().strftime("%H:%M")
+    hora = now_local().strftime("%H:%M")
     fecha = now_local().strftime("%d/%m")
 
     en_movimiento = []
@@ -1189,7 +1160,7 @@ def generar_reporte_movimientos_nocturno(vehicles):
     if not en_movimiento:
         return None
 
-    msg  = f"*🌙 MOVIMIENTOS DESPUÉS DE {AFTER_HOURS_START} - {hora}hs ({fecha})*\n"
+    msg = f"*🌙 MOVIMIENTOS DESPUÉS DE {AFTER_HOURS_START} - {hora}hs ({fecha})*\n"
     msg += "*Solo unidades en movimiento*\n\n"
 
     for v in en_movimiento:
@@ -1204,13 +1175,6 @@ def generar_reporte_movimientos_nocturno(vehicles):
 # CIERRE OPERATIVO 18HS
 # ---------------------------------------------------------------------------
 def generar_reporte_cierre_18(devices, fecha=None):
-    """
-    Reporte de cierre operativo.
-    - Inicio: primer viaje del día
-    - Fin: último viaje del día
-    - Viajes: cantidad de trips
-    - Paradas: stops reales dentro de la jornada (no cuenta la base antes de salir ni al volver)
-    """
     fecha = fecha or now_local().date()
     tz_local = timezone(timedelta(hours=-3))
 
@@ -1240,11 +1204,11 @@ def generar_reporte_cierre_18(devices, fecha=None):
             )
 
             inicio = hhmm(trips[0].get("startTime"))
-            fin    = hhmm(trips[-1].get("endTime"))
+            fin = hhmm(trips[-1].get("endTime"))
             activos += 1
 
             first_start = parse_dt_local(trips[0].get("startTime"))
-            last_end    = parse_dt_local(trips[-1].get("endTime"))
+            last_end = parse_dt_local(trips[-1].get("endTime"))
 
             stops_raw = get_report_stops(device["id"], desde, hasta)
             stops = []
@@ -1255,14 +1219,14 @@ def generar_reporte_cierre_18(devices, fecha=None):
                     continue
 
                 s_start = parse_dt_local(s.get("startTime"))
-                s_end   = parse_dt_local(s.get("endTime"))
+                s_end = parse_dt_local(s.get("endTime"))
                 if not s_start or not s_end:
                     continue
 
                 if first_start and last_end and s_start >= first_start and s_end <= last_end:
                     stops.append(s)
 
-            viajes  = len(trips)
+            viajes = len(trips)
             paradas = len(stops)
 
             estado = (
@@ -1270,11 +1234,11 @@ def generar_reporte_cierre_18(devices, fecha=None):
                 f"viajes {viajes} | paradas {paradas}"
             )
         else:
-            viajes  = 0
+            viajes = 0
             paradas = 0
             estado = f"· {display_name(plate, device.get('name'))} | sin viajes registrados"
 
-        total_viajes  += viajes
+        total_viajes += viajes
         total_paradas += paradas
         lines.append(estado)
 
@@ -1309,7 +1273,7 @@ def create_webhook_app():
             return "OK", 200
 
         from_number = freq.form.get("From", "")
-        body        = freq.form.get("Body", "").strip()
+        body = freq.form.get("Body", "").strip()
         print(f"  MSG from={from_number} body={repr(body)}")
 
         if from_number:
@@ -1318,15 +1282,15 @@ def create_webhook_app():
         if not body:
             return "OK", 200
 
-        is_admin  = from_number in set(get_admin_numbers())
+        is_admin = from_number in set(get_admin_numbers())
         twilio_cl = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
         if is_admin:
             body_lower = body.lower().strip()
             try:
-                devices   = get_devices()
+                devices = get_devices()
                 positions = get_positions()
-                vehicles  = build_vehicle_list(devices, positions)
+                vehicles = build_vehicle_list(devices, positions)
             except Exception as e:
                 devices = []
                 vehicles = []
@@ -1361,9 +1325,7 @@ def create_webhook_app():
                     "- ayuda: esta lista"
                 )
             else:
-                respuesta = (
-                    "Mensaje recibido. Comandos: reporte, cierre, resumen, clima, trafico, ayuda"
-                )
+                respuesta = "Mensaje recibido. Comandos: reporte, cierre, resumen, clima, trafico, ayuda"
 
             try:
                 send_whatsapp(twilio_cl, from_number, respuesta)
@@ -1373,7 +1335,7 @@ def create_webhook_app():
                     send_whatsapp(
                         twilio_cl,
                         from_number,
-                        "No pude enviar el mensaje completo por WhatsApp. El reporte salió demasiado largo."
+                        "No pude enviar el mensaje completo por WhatsApp. El reporte salió demasiado largo.",
                     )
                 except Exception as e2:
                     print(f"  Error enviando fallback WA: {e2}")
@@ -1406,10 +1368,10 @@ def main():
     twilio = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
     state = load_runtime_state()
-    last_summary_date   = state_get_date(state, "last_summary_date")
+    last_summary_date = state_get_date(state, "last_summary_date")
     last_cierre_18_date = state_get_date(state, "last_cierre_18_date")
 
-    print("\nAgente RutaSat v1.8 corriendo")
+    print("\nAgente RutaSat v1.9 corriendo")
     print(f"  Poll: {POLL_SECONDS}s | Ruta: {LIMITE_RUTA}km/h | Urbano: {LIMITE_URBANO}km/h | Ruta-110: 110km/h")
     if PATENTES_110:
         print(f"  Vehiculos 110km/h - Patentes: {', '.join(sorted(PATENTES_110))}")
@@ -1435,9 +1397,8 @@ def main():
         try:
             print(f"  [{now_local().strftime('%H:%M')}] Poll...", flush=True)
             hora_local = now_local()
-            today      = hora_local.date()
+            today = hora_local.date()
 
-            # Resumen diario a las 21hs
             if hora_local.hour == 21 and last_summary_date != today:
                 print("  Generando resumen diario...")
                 try:
@@ -1451,18 +1412,20 @@ def main():
                 except Exception as e:
                     print(f"  Error resumen: {e}")
 
-            # Obtener datos GPS
             try:
-                devices   = get_devices()
+                devices = get_devices()
                 positions = get_positions()
-                vehicles  = build_vehicle_list(devices, positions)
+                vehicles = build_vehicle_list(devices, positions)
+
+                active_state_keys = {vehicle_state_key(v) for v in vehicles}
+                cleanup_missing_vehicle_states(active_state_keys)
+
                 print(f"  Vehiculos: {len(vehicles)}", flush=True)
             except Exception as e:
                 print(f"  Error GPS: {e}")
                 time.sleep(30)
                 continue
 
-            # CIERRE OPERATIVO 18HS - solo una vez por dia, aun si reinicia el proceso
             if hora_local.hour >= 18 and last_cierre_18_date != today:
                 print("  Generando cierre operativo 18hs...")
                 try:
@@ -1475,7 +1438,6 @@ def main():
                 except Exception as e:
                     print(f"  Error cierre 18hs: {e}")
 
-            # REPORTE GENERAL CADA HORA: solo unidades en movimiento
             ahora = time.time()
             if ahora - last_hourly_report >= 3600:
                 try:
@@ -1497,26 +1459,26 @@ def main():
                     print(f"  Error reporte: {e}")
                     last_hourly_report = ahora
 
-            # Monitoreo por vehiculo
             ahora_ts = time.time()
             for v in vehicles:
                 try:
-                    plate       = v["plate"]
-                    lat         = v["lat"]
-                    lng         = v["lng"]
-                    speed       = v["speed_kmh"]
-                    ignition    = v["ignition"]
+                    plate = v["plate"]
+                    state_key = vehicle_state_key(v)
+                    lat = v["lat"]
+                    lng = v["lng"]
+                    speed = v["speed_kmh"]
+                    ignition = v["ignition"]
                     last_update = v.get("last_update", "")
-                    dname       = display_name(plate, v.get("name"))
-                    pos_stale   = is_position_stale(last_update, STALE_POSITION_MINUTES)
+                    dname = display_name(plate, v.get("name"))
+                    pos_stale = is_position_stale(last_update, STALE_POSITION_MINUTES)
 
                     # -------------------------------------------------------
-                    # USO FUERA DE HORARIO: alerta inmediata si empieza a moverse
+                    # USO FUERA DE HORARIO
                     # -------------------------------------------------------
                     if is_after_hours(hora_local):
                         if (not pos_stale) and speed > MOVEMENT_MIN_SPEED:
-                            if not after_hours_motion_state.get(plate):
-                                after_hours_motion_state[plate] = True
+                            if not after_hours_motion_state.get(state_key):
+                                after_hours_motion_state[state_key] = True
                                 after_msg = (
                                     f"🚨 Uso fuera de horario\n"
                                     f"· {dname}\n"
@@ -1527,35 +1489,39 @@ def main():
                                 send_to_admins(twilio, after_msg)
                                 print(f"  USO FUERA DE HORARIO: {dname} a {speed:.0f} km/h")
                         else:
-                            after_hours_motion_state.pop(plate, None)
+                            after_hours_motion_state.pop(state_key, None)
                     else:
-                        after_hours_motion_state.pop(plate, None)
+                        after_hours_motion_state.pop(state_key, None)
 
                     # -------------------------------------------------------
                     # RALENTI
-                    # Reglas:
-                    # - solo si ignition=True real
-                    # - solo si speed <= 2
-                    # - no usar posicion vieja
-                    # - limpiar estado si se apago o dato quedo viejo
                     # -------------------------------------------------------
                     if pos_stale:
-                        if plate in idle_tracking or plate in idle_alerted:
+                        if state_key in idle_tracking or state_key in idle_alerted:
                             print(f"  RALENTI RESET {dname}: posicion vieja ({last_update})")
-                        idle_tracking.pop(plate, None)
-                        idle_alerted.pop(plate, None)
+                        idle_tracking.pop(state_key, None)
+                        idle_alerted.pop(state_key, None)
+
                     elif ignition and speed <= 2 and not is_idle_excluded(v):
-                        if plate not in idle_tracking:
-                            idle_tracking[plate] = ahora_ts
-                            print(f"  RALENTI tracking iniciado: {dname}")
+                        if state_key not in idle_tracking:
+                            idle_tracking[state_key] = {
+                                "since": ahora_ts,
+                                "plate": plate,
+                                "name": v.get("name"),
+                                "device_id": v.get("device_id"),
+                            }
+                            print(f"  RALENTI tracking iniciado: {dname} | device_id={v.get('device_id')}")
                         else:
-                            minutos_idle = (ahora_ts - idle_tracking[plate]) / 60
-                            if minutos_idle >= IDLE_MINUTES and ahora_ts - idle_alerted.get(plate, 0) > 1800:
-                                idle_alerted[plate] = ahora_ts
+                            idle_info = idle_tracking[state_key]
+                            minutos_idle = (ahora_ts - idle_info["since"]) / 60
+
+                            if minutos_idle >= IDLE_MINUTES and ahora_ts - idle_alerted.get(state_key, 0) > 1800:
+                                idle_alerted[state_key] = ahora_ts
                                 idle_msg = (
                                     f"⚠️ RALENTI {dname}: motor encendido y parado "
                                     f"hace {minutos_idle:.0f} min."
                                 )
+
                                 if claude_client:
                                     try:
                                         resp = claude_client.messages.create(
@@ -1567,7 +1533,7 @@ def main():
                                                 "content": (
                                                     f"Alerta ralenti: {dname} motor encendido "
                                                     f"parado {minutos_idle:.0f} min. 2 lineas max. SIN Maps."
-                                                )
+                                                ),
                                             }],
                                         )
                                         idle_msg = resp.content[0].text.strip()
@@ -1577,6 +1543,7 @@ def main():
                                 send_to_admins(twilio, idle_msg)
                                 daily_events.append({
                                     "vehicle_key": plate,
+                                    "device_id": v.get("device_id"),
                                     "type": "ralenti",
                                     "minutes": f"{minutos_idle:.0f}",
                                     "lat": lat,
@@ -1586,15 +1553,16 @@ def main():
                                 log_event({
                                     "ts": ahora_ts,
                                     "vehicle_key": plate,
+                                    "device_id": v.get("device_id"),
                                     "type": "ralenti",
                                     "minutes": f"{minutos_idle:.0f}",
                                     "speed": 0,
                                     "limit": 0,
                                     "zone": "",
                                 })
-                                print(f"  RALENTI: {dname} - {minutos_idle:.0f} min")
+                                print(f"  RALENTI: {dname} - {minutos_idle:.0f} min | device_id={v.get('device_id')}")
                     else:
-                        if plate in idle_tracking or plate in idle_alerted:
+                        if state_key in idle_tracking or state_key in idle_alerted:
                             motivo = []
                             if not ignition:
                                 motivo.append("ignition off")
@@ -1603,25 +1571,27 @@ def main():
                             if is_idle_excluded(v):
                                 motivo.append("excluido")
                             reason = ", ".join(motivo) if motivo else "condicion salida"
-                            print(f"  RALENTI RESET {dname}: {reason}")
+                            print(f"  RALENTI RESET {dname}: {reason} | device_id={v.get('device_id')}")
 
-                        idle_tracking.pop(plate, None)
-                        idle_alerted.pop(plate, None)
+                        idle_tracking.pop(state_key, None)
+                        idle_alerted.pop(state_key, None)
 
-                    # VELOCIDAD — usar get_speed_limit()
+                    # -------------------------------------------------------
+                    # VELOCIDAD
+                    # -------------------------------------------------------
                     if pos_stale:
-                        speed_exceed_tracking.pop(plate, None)
+                        speed_exceed_tracking.pop(state_key, None)
                         continue
 
                     limit, zone = get_speed_limit(v)
 
                     if speed <= limit:
-                        speed_exceed_tracking.pop(plate, None)
+                        speed_exceed_tracking.pop(state_key, None)
                         continue
 
-                    track = speed_exceed_tracking.get(plate)
+                    track = speed_exceed_tracking.get(state_key)
                     if not track:
-                        speed_exceed_tracking[plate] = {
+                        speed_exceed_tracking[state_key] = {
                             "since": ahora_ts,
                             "max_speed": speed,
                         }
@@ -1633,11 +1603,10 @@ def main():
                     if (ahora_ts - track["since"]) < (SPEED_EXCEED_MINUTES * 60):
                         continue
 
-                    if ahora_ts - last_alert_ts.get(plate, 0) < 300:
+                    if ahora_ts - last_alert_ts.get(state_key, 0) < 300:
                         continue
 
-                    last_alert_ts[plate] = ahora_ts
-
+                    last_alert_ts[state_key] = ahora_ts
                     speed_alert = max(speed, track.get("max_speed", speed))
 
                     print(f"  {dname} -> {speed_alert:.0f} km/h (lim {limit}, {zone})")
@@ -1651,12 +1620,12 @@ def main():
                         raw_name=v.get("name"),
                     )
 
-                    # SIN Maps para evitar spam / mensajes partidos
                     send_to_admins(twilio, mensajes["admin"])
 
                     alert_history.setdefault(plate, []).append({"ts": now_iso(), "speed": speed_alert})
                     daily_events.append({
                         "vehicle_key": plate,
+                        "device_id": v.get("device_id"),
                         "speed": speed_alert,
                         "limit": limit,
                         "zone": zone,
@@ -1666,6 +1635,7 @@ def main():
                     log_event({
                         "ts": ahora_ts,
                         "vehicle_key": plate,
+                        "device_id": v.get("device_id"),
                         "type": "velocidad",
                         "speed": f"{speed_alert:.1f}",
                         "limit": limit,
