@@ -123,8 +123,8 @@ PATENTES_110: set = {
 }
 
 NOMBRE_VEHICULO = {
-    "ORF347": "Kangoo EX.1.6 #Santa Rosa Colon",
-    "ORF342": "Kangoo EX.1.6 #Rio Tercero",
+    "ORF347": "Kangoo EX.1.6 #Rio Tercero",
+    "ORF342": "Kangoo EX.1.6 #Colon Santa Rosa",
     "KCB412": "Partner 1.6 HDI",
     "AH516HY": "KWID #Maxi",
     "AH516HX": "KWID #Ariel",
