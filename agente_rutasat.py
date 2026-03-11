@@ -56,6 +56,9 @@ WEATHER_BACKOFF_SECONDS = int(os.getenv("WEATHER_BACKOFF_SECONDS", "900"))   # 1
 WEATHER_CACHE_PRECISION = int(os.getenv("WEATHER_CACHE_PRECISION", "1"))     # 1 decimal
 WEATHER_REQUEST_TIMEOUT = int(os.getenv("WEATHER_REQUEST_TIMEOUT", "10"))
 
+# Anti-datos viejos / GPS colgado
+STALE_POSITION_MINUTES = int(os.getenv("STALE_POSITION_MINUTES", "10"))
+
 # Zonas urbanas — ajustar segun la empresa
 URBAN_BBOXES = {
     "RIO_TERCERO": (-32.20, -64.14, -32.12, -64.05),
@@ -146,8 +149,8 @@ NOMBRE_VEHICULO = {
     "A073EQT": "Ale Brignone",
     "A161TWU": "Lucas Novareti",
     "A255DSL": "Valentin Acoto",
-    "AA706VW": "Murgui", 
-    "NWD463": "Leo Acevedo", 
+    "AA706VW": "Murgui",
+    "NWD463":  "Leo Acevedo",
 }
 
 # ---------------------------------------------------------------------------
@@ -173,7 +176,7 @@ PATENTES_REPORTE_18: set = {
     "A276PHN",
     "A198FWR",
     "AA706VW",
-    "NWD463", 
+    "NWD463",
 }
 
 
@@ -332,6 +335,47 @@ def parse_hhmm(text, default=(20, 30)):
     except Exception:
         pass
     return default
+
+
+def to_bool(value):
+    """
+    Convierte correctamente valores típicos de APIs:
+    True/False, 1/0, "true"/"false", "on"/"off", etc.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        v = value.strip().lower()
+        return v in ("true", "1", "yes", "y", "si", "sí", "on", "encendido")
+    return False
+
+
+def extract_position_timestamp(pos):
+    """
+    Toma el mejor timestamp disponible de la posición.
+    Prioridad:
+    - fixTime
+    - deviceTime
+    - serverTime
+    """
+    for key in ("fixTime", "deviceTime", "serverTime"):
+        value = pos.get(key)
+        dt = parse_dt_local(value)
+        if dt:
+            return value
+    return ""
+
+
+def is_position_stale(last_update, max_age_minutes=STALE_POSITION_MINUTES):
+    dt = parse_dt_local(last_update)
+    if not dt:
+        return True
+    age = now_local() - dt
+    return age.total_seconds() > (max_age_minutes * 60)
 
 
 AFTER_HOURS_START_HM = parse_hhmm(AFTER_HOURS_START, (20, 30))
@@ -540,8 +584,14 @@ def build_vehicle_list(devices, positions):
         if plate in DISPOSITIVOS_EXCLUIDOS:
             continue
 
-        attrs    = pos.get("attributes", {})
-        ignition = bool(attrs.get("ignition", False))
+        attrs = pos.get("attributes", {}) or {}
+
+        ignition_raw = (
+            attrs.get("ignition")
+            if "ignition" in attrs else
+            attrs.get("ignitionOn")
+        )
+        ignition = to_bool(ignition_raw)
 
         vehicles.append({
             "plate":       plate,
@@ -551,7 +601,7 @@ def build_vehicle_list(devices, positions):
             "lng":         float(pos.get("longitude", 0) or 0),
             "speed_kmh":   knots_to_kmh(pos.get("speed", 0)),
             "ignition":    ignition,
-            "last_update": pos.get("deviceTime", ""),
+            "last_update": extract_position_timestamp(pos),
         })
     return vehicles
 
@@ -723,13 +773,13 @@ def get_weather(lat, lng):
 
 def _wcode(code):
     codes = {
-        0:"Despejado", 1:"Mayormente despejado", 2:"Parcialmente nublado", 3:"Nublado",
-        45:"Niebla", 48:"Niebla con escarcha",
-        51:"Llovizna leve", 53:"Llovizna moderada", 55:"Llovizna intensa",
-        61:"Lluvia leve", 63:"Lluvia moderada", 65:"Lluvia intensa",
-        71:"Nevada leve", 73:"Nevada moderada", 75:"Nevada intensa",
-        80:"Chubascos leves", 81:"Chubascos moderados", 82:"Chubascos violentos",
-        95:"Tormenta electrica", 99:"Tormenta con granizo",
+        0: "Despejado", 1: "Mayormente despejado", 2: "Parcialmente nublado", 3: "Nublado",
+        45: "Niebla", 48: "Niebla con escarcha",
+        51: "Llovizna leve", 53: "Llovizna moderada", 55: "Llovizna intensa",
+        61: "Lluvia leve", 63: "Lluvia moderada", 65: "Lluvia intensa",
+        71: "Nevada leve", 73: "Nevada moderada", 75: "Nevada intensa",
+        80: "Chubascos leves", 81: "Chubascos moderados", 82: "Chubascos violentos",
+        95: "Tormenta electrica", 99: "Tormenta con granizo",
     }
     return codes.get(code, f"Codigo {code}")
 
@@ -821,10 +871,10 @@ def get_traffic_incidents(lat, lng, radius_km=5):
 
 def _tomtom_cat(icon):
     cats = {
-        0:"Desconocido", 1:"Accidente", 2:"Niebla", 3:"Peligro",
-        4:"Lluvia", 5:"Hielo", 6:"Congestion", 7:"Viento",
-        8:"Corte de calle", 9:"Obras", 10:"Cierre de carril",
-        11:"Corte de ruta", 14:"Ruta bloqueada",
+        0: "Desconocido", 1: "Accidente", 2: "Niebla", 3: "Peligro",
+        4: "Lluvia", 5: "Hielo", 6: "Congestion", 7: "Viento",
+        8: "Corte de calle", 9: "Obras", 10: "Cierre de carril",
+        11: "Corte de ruta", 14: "Ruta bloqueada",
     }
     return cats.get(icon, f"Tipo {icon}")
 
@@ -1359,7 +1409,7 @@ def main():
     last_summary_date   = state_get_date(state, "last_summary_date")
     last_cierre_18_date = state_get_date(state, "last_cierre_18_date")
 
-    print("\nAgente RutaSat v1.7 corriendo")
+    print("\nAgente RutaSat v1.8 corriendo")
     print(f"  Poll: {POLL_SECONDS}s | Ruta: {LIMITE_RUTA}km/h | Urbano: {LIMITE_URBANO}km/h | Ruta-110: 110km/h")
     if PATENTES_110:
         print(f"  Vehiculos 110km/h - Patentes: {', '.join(sorted(PATENTES_110))}")
@@ -1376,6 +1426,7 @@ def main():
     print(f"  Estado persistente: {STATE_FILE}")
     print(f"  Exceso de velocidad sostenido: {SPEED_EXCEED_MINUTES} min")
     print(f"  Clima cache TTL: {WEATHER_CACHE_TTL}s | backoff 429: {WEATHER_BACKOFF_SECONDS}s")
+    print(f"  Posicion vieja: {STALE_POSITION_MINUTES} min")
     print()
 
     global last_hourly_report
@@ -1450,18 +1501,20 @@ def main():
             ahora_ts = time.time()
             for v in vehicles:
                 try:
-                    plate    = v["plate"]
-                    lat      = v["lat"]
-                    lng      = v["lng"]
-                    speed    = v["speed_kmh"]
-                    ignition = v["ignition"]
-                    dname    = display_name(plate, v.get("name"))
+                    plate       = v["plate"]
+                    lat         = v["lat"]
+                    lng         = v["lng"]
+                    speed       = v["speed_kmh"]
+                    ignition    = v["ignition"]
+                    last_update = v.get("last_update", "")
+                    dname       = display_name(plate, v.get("name"))
+                    pos_stale   = is_position_stale(last_update, STALE_POSITION_MINUTES)
 
                     # -------------------------------------------------------
                     # USO FUERA DE HORARIO: alerta inmediata si empieza a moverse
                     # -------------------------------------------------------
                     if is_after_hours(hora_local):
-                        if speed > MOVEMENT_MIN_SPEED:
+                        if (not pos_stale) and speed > MOVEMENT_MIN_SPEED:
                             if not after_hours_motion_state.get(plate):
                                 after_hours_motion_state[plate] = True
                                 after_msg = (
@@ -1478,10 +1531,23 @@ def main():
                     else:
                         after_hours_motion_state.pop(plate, None)
 
-                    # RALENTI (excluyendo solo A241VOY)
-                    if ignition and speed <= 2 and not is_idle_excluded(v):
+                    # -------------------------------------------------------
+                    # RALENTI
+                    # Reglas:
+                    # - solo si ignition=True real
+                    # - solo si speed <= 2
+                    # - no usar posicion vieja
+                    # - limpiar estado si se apago o dato quedo viejo
+                    # -------------------------------------------------------
+                    if pos_stale:
+                        if plate in idle_tracking or plate in idle_alerted:
+                            print(f"  RALENTI RESET {dname}: posicion vieja ({last_update})")
+                        idle_tracking.pop(plate, None)
+                        idle_alerted.pop(plate, None)
+                    elif ignition and speed <= 2 and not is_idle_excluded(v):
                         if plate not in idle_tracking:
                             idle_tracking[plate] = ahora_ts
+                            print(f"  RALENTI tracking iniciado: {dname}")
                         else:
                             minutos_idle = (ahora_ts - idle_tracking[plate]) / 60
                             if minutos_idle >= IDLE_MINUTES and ahora_ts - idle_alerted.get(plate, 0) > 1800:
@@ -1496,9 +1562,13 @@ def main():
                                             model="claude-sonnet-4-20250514",
                                             max_tokens=150,
                                             system=SYSTEM_PROMPT,
-                                            messages=[{"role": "user", "content":
-                                                f"Alerta ralenti: {dname} motor encendido "
-                                                f"parado {minutos_idle:.0f} min. 2 lineas max. SIN Maps."}],
+                                            messages=[{
+                                                "role": "user",
+                                                "content": (
+                                                    f"Alerta ralenti: {dname} motor encendido "
+                                                    f"parado {minutos_idle:.0f} min. 2 lineas max. SIN Maps."
+                                                )
+                                            }],
                                         )
                                         idle_msg = resp.content[0].text.strip()
                                     except Exception:
@@ -1524,9 +1594,25 @@ def main():
                                 })
                                 print(f"  RALENTI: {dname} - {minutos_idle:.0f} min")
                     else:
+                        if plate in idle_tracking or plate in idle_alerted:
+                            motivo = []
+                            if not ignition:
+                                motivo.append("ignition off")
+                            if speed > 2:
+                                motivo.append(f"speed {speed:.1f}")
+                            if is_idle_excluded(v):
+                                motivo.append("excluido")
+                            reason = ", ".join(motivo) if motivo else "condicion salida"
+                            print(f"  RALENTI RESET {dname}: {reason}")
+
                         idle_tracking.pop(plate, None)
+                        idle_alerted.pop(plate, None)
 
                     # VELOCIDAD — usar get_speed_limit()
+                    if pos_stale:
+                        speed_exceed_tracking.pop(plate, None)
+                        continue
+
                     limit, zone = get_speed_limit(v)
 
                     if speed <= limit:
