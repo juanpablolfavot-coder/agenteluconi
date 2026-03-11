@@ -140,12 +140,14 @@ NOMBRE_VEHICULO = {
     "AH516HX": "KWID #Ariel",
     "AG369ZD": "Sandero #Dario",
     "AG369ZC": "Sandero #Agustin",
-    "AG677LX": "Sandero #Martin",
-    "AG677LW": "Sandero #Jairo",
-    "JFV680":  "VW Fox 1.6",
+    "AG677LX": "Sandero #MJairo",
+    "AG677LW": "Sandero #Martin",
+    "JFV680":  "VW Fox 1.6 #Malagueño",
     "A073EQT": "Ale Brignone",
     "A161TWU": "Lucas Novareti",
     "A255DSL": "Valentin Acoto",
+    "AA706VW": "Murgui", 
+    "NWD463": "Leo Acevedo", 
 }
 
 # ---------------------------------------------------------------------------
@@ -170,6 +172,8 @@ PATENTES_REPORTE_18: set = {
     "A276PHM",
     "A276PHN",
     "A198FWR",
+    "AA706VW",
+    "NWD463", 
 }
 
 
