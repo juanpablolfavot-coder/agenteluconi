@@ -133,8 +133,8 @@ PATENTES_110: set = {
 # MAPA PATENTE → NOMBRE LEGIBLE
 # ---------------------------------------------------------------------------
 NOMBRE_VEHICULO = {
-    "ORF347":  "Kangoo EX.1.6 #Rio Tercero",
-    "ORF342":  "Kangoo EX.1.6 #Santa Rosa",
+    "ORF347":  "Kangoo EX.1.6 #Santa Rosa Colon",
+    "ORF342":  "Kangoo EX.1.6 #Rio Tercero",
     "KCB412":  "Partner 1.6 HDI",
     "AH516HY": "KWID #Maxi",
     "AH516HX": "KWID #Ariel",
