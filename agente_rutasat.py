@@ -78,6 +78,10 @@ RALENTI_EXCLUIDOS_MATCH: set = {
     "A241VOY",
 }
 
+AFTER_HOURS_EXCLUIDOS_MATCH: set = {
+    "A241VOY",
+}
+
 
 # ---------------------------------------------------------------------------
 # UTILS DE PATENTES
@@ -393,6 +397,17 @@ def is_idle_excluded(vehicle):
     name_txt = normalize_plate(vehicle.get("name", ""))
 
     for token in RALENTI_EXCLUIDOS_MATCH:
+        token_norm = normalize_plate(token)
+        if token_norm and (token_norm in plate_txt or token_norm in name_txt):
+            return True
+    return False
+
+
+def is_after_hours_excluded(vehicle):
+    plate_txt = normalize_plate(vehicle.get("plate", ""))
+    name_txt = normalize_plate(vehicle.get("name", ""))
+
+    for token in AFTER_HOURS_EXCLUIDOS_MATCH:
         token_norm = normalize_plate(token)
         if token_norm and (token_norm in plate_txt or token_norm in name_txt):
             return True
@@ -1385,6 +1400,7 @@ def main():
     print(f"  Reporte horario: solo si hay movimiento > {MOVEMENT_MIN_SPEED} km/h")
     print(f"  Uso fuera de horario: {AFTER_HOURS_START} a {AFTER_HOURS_END}")
     print(f"  Ralenti excluido para: {', '.join(sorted(RALENTI_EXCLUIDOS_MATCH))}")
+    print(f"  Fuera de horario excluido para: {', '.join(sorted(AFTER_HOURS_EXCLUIDOS_MATCH))}")
     print(f"  Estado persistente: {STATE_FILE}")
     print(f"  Exceso de velocidad sostenido: {SPEED_EXCEED_MINUTES} min")
     print(f"  Clima cache TTL: {WEATHER_CACHE_TTL}s | backoff 429: {WEATHER_BACKOFF_SECONDS}s")
@@ -1475,7 +1491,9 @@ def main():
                     # -------------------------------------------------------
                     # USO FUERA DE HORARIO
                     # -------------------------------------------------------
-                    if is_after_hours(hora_local):
+                    if is_after_hours_excluded(v):
+                        after_hours_motion_state.pop(state_key, None)
+                    elif is_after_hours(hora_local):
                         if (not pos_stale) and speed > MOVEMENT_MIN_SPEED:
                             if not after_hours_motion_state.get(state_key):
                                 after_hours_motion_state[state_key] = True
