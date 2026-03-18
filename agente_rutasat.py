@@ -1168,6 +1168,8 @@ def generar_reporte_movimientos_nocturno(vehicles):
     for v in vehicles:
         if v["plate"] in DISPOSITIVOS_EXCLUIDOS:
             continue
+        if is_after_hours_excluded(v):
+            continue
         if v["speed_kmh"] > MOVEMENT_MIN_SPEED:
             limit, zone = get_speed_limit(v)
             en_movimiento.append({**v, "limit": limit, "zone": zone})
