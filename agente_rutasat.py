@@ -783,13 +783,16 @@ def _nexpro_login():
         return m.group(1) if m else ""
 
     html = r.text
+    # Nombres reales de los campos (inspeccionados del HTML real del form)
     login_payload = {
+        "__EVENTTARGET":        "",
+        "__EVENTARGUMENT":      "",
         "__VIEWSTATE":          _extract_field("__VIEWSTATE", html),
         "__VIEWSTATEGENERATOR": _extract_field("__VIEWSTATEGENERATOR", html),
         "__EVENTVALIDATION":    _extract_field("__EVENTVALIDATION", html),
-        "txtUsuario":           NEXPRO_EMAIL,
-        "txtContrasenia":       NEXPRO_PASSWORD,
-        "btnEntrar":            "Entrar",
+        "ctl00$contenidoMaster$txtMail":  NEXPRO_EMAIL,
+        "ctl00$contenidoMaster$txtClave": NEXPRO_PASSWORD,
+        "ctl00$contenidoMaster$btnIr":    "Ingresar",
     }
 
     # 2) POST de login
@@ -801,6 +804,7 @@ def _nexpro_login():
     )
     r2.raise_for_status()
 
+    # Si sigue en login2 = credenciales incorrectas
     if "login2" in r2.url.lower():
         raise RuntimeError("NexproConnect: login fallido — verificá usuario/contraseña")
 
