@@ -13,6 +13,15 @@ import anthropic
 import requests
 from twilio.rest import Client
 
+# Analytics (módulo opcional — si no existe, funciona en modo básico)
+try:
+    from analytics import init_analytics, get_analytics
+    ANALYTICS_AVAILABLE = True
+except ImportError:
+    ANALYTICS_AVAILABLE = False
+    def init_analytics(*a, **kw): return {}
+    def get_analytics(): return {}
+
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -53,7 +62,6 @@ WEATHER_CACHE_PRECISION = int(os.getenv("WEATHER_CACHE_PRECISION", "1"))
 WEATHER_REQUEST_TIMEOUT = int(os.getenv("WEATHER_REQUEST_TIMEOUT", "10"))
 
 STALE_POSITION_MINUTES = int(os.getenv("STALE_POSITION_MINUTES", "10"))
-STALE_ALERT_HOURS = int(os.getenv("STALE_ALERT_HOURS", "2"))
 
 LOG_PATH = os.getenv("LOG_PATH", "logs_alertas_rutasat.csv")
 LOG_FIELDNAMES = [
@@ -217,7 +225,6 @@ after_hours_motion_state = {}
 last_alert_ts = {}
 
 # FIX: rastreo de alertas por GPS congelado
-stale_alerted = {}
 
 weather_cache = {}
 weather_rate_limited_until = 0
@@ -784,6 +791,26 @@ def log_event(row, path=LOG_PATH):
             writer.writeheader()
         writer.writerow(payload)
 
+    # También persistir en SQLite si analytics está activo
+    if ANALYTICS_AVAILABLE:
+        try:
+            an = get_analytics()
+            db = an.get("db")
+            if db:
+                db.log_event(
+                    plate=str(row.get("vehicle_key", "?")).upper(),
+                    type_=str(row.get("type", "velocidad")),
+                    ts=float(row["ts"]) if row.get("ts") else None,
+                    device_id=str(row.get("device_id", "")),
+                    speed=float(row.get("speed", 0) or 0),
+                    limit_kmh=float(row.get("limit", 0) or 0),
+                    zone=str(row.get("zone", "")),
+                    minutes=float(row.get("minutes", 0) or 0),
+                    severity=str(row.get("severity", "media")),
+                )
+        except Exception as _e:
+            pass  # analytics falla silenciosamente
+
 
 # ---------------------------------------------------------------------------
 # CLIMA (Open-Meteo — gratis, sin API key)
@@ -1027,6 +1054,16 @@ def init_claude():
         print("  Claude IA conectado")
     else:
         print("  Sin ANTHROPIC_API_KEY -- modo basico")
+
+    # Inicializar analytics (migra CSV si existe)
+    if ANALYTICS_AVAILABLE:
+        init_analytics(
+            claude_client=claude_client,
+            system_prompt=SYSTEM_PROMPT,
+            migrate_csv=LOG_PATH if os.path.exists(LOG_PATH) else None,
+        )
+    else:
+        print("  analytics.py no encontrado — modo basico sin perfiles de riesgo")
 
 
 def ia_generar_alerta(plate, speed, limit, zone, lat=None, lng=None, raw_name=None):
@@ -1443,6 +1480,19 @@ def create_webhook_app():
                 vehicles = []
                 print(f"  Error GPS: {e}")
 
+            # Config dinámica — debe ir primero para capturar "config ..."
+            if ANALYTICS_AVAILABLE:
+                an = get_analytics()
+                dynconfig = an.get("dynconfig")
+                if dynconfig:
+                    config_resp = dynconfig.parse_command(body)
+                    if config_resp is not None:
+                        try:
+                            send_whatsapp(twilio_cl, from_number, config_resp)
+                        except Exception as e:
+                            print(f"  Error WA config: {e}")
+                        return "OK", 200
+
             if any(x in body_lower for x in ["reporte", "estado", "flota"]):
                 if is_after_hours(now_local()):
                     respuesta = generar_reporte_movimientos_nocturno(vehicles) or "Sin vehículos en movimiento en este momento."
@@ -1503,6 +1553,7 @@ def create_webhook_app():
                 else:
                     respuesta = "Formato: excluir [patente]. Ej: excluir ABC123"
 
+
             # FIX: nuevo comando "activar [patente]"
             elif body_lower.startswith("activar"):
                 words = body.split()
@@ -1540,7 +1591,114 @@ def create_webhook_app():
                 else:
                     respuesta = "No hay vehículos excluidos temporalmente."
 
+            # Perfil de conductor
+            elif body_lower.startswith("perfil"):
+                if ANALYTICS_AVAILABLE:
+                    words = body.split()
+                    plate_q = normalize_plate(words[-1]) if len(words) > 1 else ""
+                    # buscar patente en vehículos activos
+                    found_plate = None
+                    for v in vehicles:
+                        if plate_q and plate_q in normalize_plate(v.get("plate", "")):
+                            found_plate = v["plate"]
+                            break
+                    if not found_plate and plate_q:
+                        found_plate = plate_q
+                    if found_plate:
+                        an = get_analytics()
+                        reporter = an.get("reporter")
+                        if reporter:
+                            respuesta = reporter.generate_driver_profile_report(found_plate)
+                        else:
+                            respuesta = "Módulo de perfiles no disponible."
+                    else:
+                        respuesta = "Formato: perfil [patente]. Ej: perfil AG369ZD"
+                else:
+                    respuesta = "Analytics no disponible. Verificar analytics.py."
+
+            # Reporte semanal on-demand
+            elif any(x in body_lower for x in ["semanal", "semana"]):
+                if ANALYTICS_AVAILABLE:
+                    an = get_analytics()
+                    reporter = an.get("reporter")
+                    if reporter:
+                        respuesta = "Calculando reporte semanal... 📊"
+                        send_whatsapp(twilio_cl, from_number, respuesta)
+                        weekly_stats = reporter.compute_weekly_stats()
+                        respuesta = reporter.generate_whatsapp_report(weekly_stats)
+                    else:
+                        respuesta = "Reporter no disponible."
+                else:
+                    respuesta = "Analytics no disponible."
+
+            # Ranking de riesgo
+            elif any(x in body_lower for x in ["ranking", "riesgo", "conductores"]):
+                if ANALYTICS_AVAILABLE:
+                    an = get_analytics()
+                    db = an.get("db")
+                    profiler = an.get("profiler")
+                    if db and profiler:
+                        offenders = db.top_offenders(days=7, limit=8)
+                        if offenders:
+                            lines = ["*🏆 Ranking de riesgo (7 días)*"]
+                            for i, row in enumerate(offenders, 1):
+                                profile = db.risk_profile(row["plate"])
+                                score = profile["score"] if profile else 0
+                                emoji = profiler.risk_emoji(score)
+                                try:
+                                    name = display_name(row["plate"])
+                                except Exception:
+                                    name = row["plate"]
+                                lines.append(
+                                    f"  {i}. {emoji} {name} — "
+                                    f"{row['speed_cnt']} exc / {row['idle_cnt']} ral / "
+                                    f"max {row['max_speed']:.0f}km/h"
+                                )
+                            respuesta = "\n".join(lines)
+                        else:
+                            respuesta = "Sin datos de la última semana."
+                    else:
+                        respuesta = "DB no disponible."
+                else:
+                    respuesta = "Analytics no disponible."
+
+            # Estimación de combustible
+            elif any(x in body_lower for x in ["combustible", "consumo", "nafta"]):
+                if ANALYTICS_AVAILABLE:
+                    an = get_analytics()
+                    fuel = an.get("fuel")
+                    if fuel:
+                        lines = ["*⛽ Estimación de consumo hoy*"]
+                        abnormal = []
+                        for v in vehicles:
+                            est = fuel.estimate_penalty_factor(v["plate"], days=1)
+                            if est["is_abnormal"]:
+                                abnormal.append((v["plate"], est))
+                        if abnormal:
+                            for plate_f, est in sorted(abnormal, key=lambda x: x[1]["factor"], reverse=True):
+                                lines.append(
+                                    f"  · {display_name(plate_f)} — ~{est['estimated_l100']}L/100km "
+                                    f"(+{est['excess_pct']:.0f}% sobre base)"
+                                )
+                        else:
+                            lines.append("  · Consumo dentro de parámetros normales hoy ✅")
+                        respuesta = "\n".join(lines)
+                    else:
+                        respuesta = "Estimador no disponible."
+                else:
+                    respuesta = "Analytics no disponible."
+
             elif any(x in body_lower for x in ["ayuda", "comandos"]):
+                analytics_cmds = (
+                    "\n📊 Analytics:\n"
+                    "- perfil [patente]: perfil de riesgo del conductor\n"
+                    "- semanal: reporte semanal con ranking\n"
+                    "- ranking: top conductores de riesgo (7 días)\n"
+                    "- combustible: estimación de consumo anormal\n"
+                    "- config: ver/cambiar configuración dinámica\n"
+                    "  ej: config vel_ruta 90 | config ralenti 8"
+                ) if ANALYTICS_AVAILABLE else ""
+
                 respuesta = (
                     "Comandos disponibles:\n"
                     "- reporte: vehículos en movimiento\n"
@@ -1549,12 +1707,11 @@ def create_webhook_app():
                     "- velocidades: ranking de excesos\n"
                     "- alertas: incidencias de hoy\n"
                     "- donde [patente]: ubicación de un vehículo\n"
-                    "- excluir [patente]: excluir GPS roto temporalmente\n"
-                    "- activar [patente]: reactivar vehículo excluido\n"
-                    "- excluidos: lista de excluidos actuales\n"
+                    "- excluir [patente] / activar [patente]: excluir del monitoreo\n"
                     "- clima: condiciones meteorológicas\n"
                     "- trafico: incidentes viales\n"
-                    "- ayuda: esta lista"
+                    + analytics_cmds +
+                    "\n- ayuda: esta lista"
                 )
             else:
                 respuesta = "Mensaje recibido. Comandos: reporte, cierre, resumen, velocidades, alertas, donde [patente], excluir [patente], ayuda"
@@ -1627,7 +1784,6 @@ def main():
     print(f"  GPS excluidos temporales: {', '.join(sorted(GPS_EXCLUIDOS_TEMPORALES)) or 'ninguno'}")
     print(f"  Estado persistente: {STATE_FILE}")
     print(f"  Exceso de velocidad sostenido: {SPEED_EXCEED_MINUTES} min")
-    print(f"  Alerta GPS sin señal: {STALE_ALERT_HOURS}hs")
     print(f"  Clima cache TTL: {WEATHER_CACHE_TTL}s | backoff 429: {WEATHER_BACKOFF_SECONDS}s")
     print(f"  Posicion vieja: {STALE_POSITION_MINUTES} min")
     print(f"  Geocodificacion inversa: Nominatim (gratis)")
@@ -1648,11 +1804,41 @@ def main():
                     send_to_admins(twilio, resumen)
                     last_summary_date = today
                     state_set_date(state, "last_summary_date", today)
+
+                    # Calcular perfiles de riesgo del día
+                    if ANALYTICS_AVAILABLE:
+                        try:
+                            an = get_analytics()
+                            if an.get("profiler"):
+                                an["profiler"].compute_all_profiles()
+                                print("  Perfiles de riesgo calculados")
+                        except Exception as e:
+                            print(f"  Error perfiles: {e}")
+
                     save_runtime_state(state)
                     daily_events.clear()
                     print("  Resumen enviado")
                 except Exception as e:
                     print(f"  Error resumen: {e}")
+
+            # Reporte semanal — domingos a las 20hs
+            if hora_local.weekday() == 6 and hora_local.hour == 20:
+                last_weekly = state.get("last_weekly_date", "")
+                if last_weekly != today.isoformat():
+                    print("  Generando reporte semanal...")
+                    try:
+                        if ANALYTICS_AVAILABLE:
+                            an = get_analytics()
+                            reporter = an.get("reporter")
+                            if reporter:
+                                weekly_stats = reporter.compute_weekly_stats()
+                                reporte_semanal = reporter.generate_whatsapp_report(weekly_stats)
+                                send_to_admins(twilio, reporte_semanal)
+                                state["last_weekly_date"] = today.isoformat()
+                                save_runtime_state(state)
+                                print("  Reporte semanal enviado")
+                    except Exception as e:
+                        print(f"  Error reporte semanal: {e}")
 
             try:
                 devices = get_devices()
@@ -1718,18 +1904,30 @@ def main():
                     if is_gps_temp_excluded(v):
                         continue
 
-                    # FIX: alerta de GPS sin señal prolongada
-                    if pos_stale:
-                        last_stale_alert = stale_alerted.get(state_key, 0)
-                        if (ahora_ts - last_stale_alert) > (STALE_ALERT_HOURS * 3600):
-                            stale_alerted[state_key] = ahora_ts
-                            stale_msg = (
-                                f"📡 GPS sin señal: {dname}\n"
-                                f"  · Última pos.: {hhmm(last_update)}\n"
-                                f"  · Para excluirlo temporalmente: excluir {plate}"
-                            )
-                            send_to_admins(twilio, stale_msg)
-                            print(f"  GPS STALE ALERTA: {dname} ultima pos {hhmm(last_update)}")
+                    # Analytics: registrar posición y detectar anomalías
+                    if ANALYTICS_AVAILABLE and not pos_stale:
+                        try:
+                            an = get_analytics()
+                            db = an.get("db")
+                            detector = an.get("detector")
+                            if db:
+                                db.log_position(plate, lat, lng, speed, ignition, ahora_ts)
+                            if detector:
+                                anomalies = detector.check_position(plate, lat, lng, speed, ahora_ts)
+                                for anom in anomalies:
+                                    print(f"  ANOMALIA {dname}: {anom}")
+                                    if db:
+                                        db.log_event(
+                                            plate=plate, type_="anomalia",
+                                            ts=ahora_ts, lat=lat, lng=lng,
+                                            extra={"detail": anom},
+                                        )
+                                    if anomalies and ahora_ts - last_alert_ts.get(f"anom_{state_key}", 0) > 3600:
+                                        last_alert_ts[f"anom_{state_key}"] = ahora_ts
+                                        send_to_admins(twilio, f"🚨 Anomalía GPS: {dname}\n  · {anom}")
+                        except Exception as _ae:
+                            pass
+
 
                     # -------------------------------------------------------
                     # USO FUERA DE HORARIO
