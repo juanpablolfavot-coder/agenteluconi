@@ -53,6 +53,7 @@ WEATHER_CACHE_PRECISION = int(os.getenv("WEATHER_CACHE_PRECISION", "1"))
 WEATHER_REQUEST_TIMEOUT = int(os.getenv("WEATHER_REQUEST_TIMEOUT", "10"))
 
 STALE_POSITION_MINUTES = int(os.getenv("STALE_POSITION_MINUTES", "10"))
+STALE_ALERT_HOURS = int(os.getenv("STALE_ALERT_HOURS", "2"))
 
 LOG_PATH = os.getenv("LOG_PATH", "logs_alertas_rutasat.csv")
 LOG_FIELDNAMES = [
@@ -73,6 +74,12 @@ URBAN_BBOXES = {
 }
 
 DISPOSITIVOS_EXCLUIDOS: set = set()
+
+# GPS congelado: excluidos temporalmente via envvar
+_gps_temp_raw = os.getenv("GPS_EXCLUIDOS_TEMPORALES", "")
+GPS_EXCLUIDOS_TEMPORALES: set = set(
+    x.strip() for x in _gps_temp_raw.split(",") if x.strip()
+)
 
 RALENTI_EXCLUIDOS_MATCH: set = {
     "A241VOY",
@@ -209,11 +216,17 @@ speed_exceed_tracking = {}
 after_hours_motion_state = {}
 last_alert_ts = {}
 
+# FIX: rastreo de alertas por GPS congelado
+stale_alerted = {}
+
 weather_cache = {}
 weather_rate_limited_until = 0
 
 traffic_cache = {}
 wa_session_active = {}
+
+# FIX: cache de geocodificacion inversa
+geocode_cache = {}
 
 _rutasat_token = None
 _rutasat_token_expiry = 0
@@ -255,6 +268,23 @@ def state_get_date(state, key):
 
 def state_set_date(state, key, value_date):
     state[key] = value_date.isoformat() if value_date else None
+
+
+# FIX: persistir daily_events en el estado
+def load_daily_events_from_state(state):
+    today = now_local().date().isoformat()
+    saved = state.get("daily_events", {})
+    if saved.get("date") == today:
+        return saved.get("events", [])
+    return []
+
+
+def save_daily_events_to_state(state):
+    today = now_local().date().isoformat()
+    state["daily_events"] = {
+        "date": today,
+        "events": daily_events[-500:],  # limitar a ultimos 500
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +444,17 @@ def is_after_hours_excluded(vehicle):
     return False
 
 
+def is_gps_temp_excluded(vehicle):
+    """FIX: chequea si el vehiculo esta excluido temporalmente por GPS roto."""
+    plate = normalize_plate(vehicle.get("plate", ""))
+    name = normalize_plate(vehicle.get("name", ""))
+    for token in GPS_EXCLUIDOS_TEMPORALES:
+        t = normalize_plate(token)
+        if t and (t in plate or t in name):
+            return True
+    return False
+
+
 def split_whatsapp_text(text, limit=MAX_WA_BODY):
     text = (text or "").strip()
     if not text:
@@ -453,6 +494,74 @@ def split_whatsapp_text(text, limit=MAX_WA_BODY):
 
     total = len(parts)
     return [f"({i}/{total})\n{part}" for i, part in enumerate(parts, 1)]
+
+
+# ---------------------------------------------------------------------------
+# GEOCODIFICACION INVERSA (Nominatim — gratis, sin API key)
+# ---------------------------------------------------------------------------
+GEOCODE_CACHE_TTL = 86400  # 24 horas, las calles no cambian
+GEOCODE_PRECISION = 3      # redondear a ~100m para maximizar cache hits
+GEOCODE_TIMEOUT = 5
+
+
+def reverse_geocode(lat, lng):
+    """Devuelve string legible como 'Ruta 9, Villa Maria' o None si falla."""
+    lat_r = round(float(lat), GEOCODE_PRECISION)
+    lng_r = round(float(lng), GEOCODE_PRECISION)
+    cache_key = f"{lat_r},{lng_r}"
+
+    ahora = time.time()
+    cached = geocode_cache.get(cache_key)
+    if cached and (ahora - cached["ts"]) < GEOCODE_CACHE_TTL:
+        return cached["data"]
+
+    try:
+        url = "https://nominatim.openstreetmap.org/reverse"
+        params = {
+            "lat": lat_r,
+            "lon": lng_r,
+            "format": "jsonv2",
+            "zoom": 16,
+            "addressdetails": 1,
+        }
+        headers = {"User-Agent": "RutaSat-Monitor/1.0"}
+        r = requests.get(url, params=params, headers=headers, timeout=GEOCODE_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+
+        addr = data.get("address", {})
+        parts = []
+
+        road = addr.get("road") or addr.get("highway") or addr.get("path")
+        if road:
+            parts.append(road)
+
+        city = (
+            addr.get("city")
+            or addr.get("town")
+            or addr.get("village")
+            or addr.get("municipality")
+        )
+        if city:
+            parts.append(city)
+
+        result = ", ".join(parts) if parts else data.get("display_name", "")[:60]
+
+        geocode_cache[cache_key] = {"ts": ahora, "data": result}
+        return result
+
+    except Exception as e:
+        print(f"  Geocode error: {e}")
+        geocode_cache[cache_key] = {"ts": ahora, "data": None}
+        return None
+
+
+def format_location(lat, lng):
+    """Devuelve nombre de lugar si disponible, sino coordenadas."""
+    name = reverse_geocode(lat, lng)
+    if name:
+        return name
+    return format_coords(lat, lng)
 
 
 # ---------------------------------------------------------------------------
@@ -949,13 +1058,20 @@ def ia_generar_alerta(plate, speed, limit, zone, lat=None, lng=None, raw_name=No
         if incidents and has_significant_traffic(incidents):
             trafico_ctx = f"\n- TRAFICO: {format_traffic_short(incidents)}"
 
+    # FIX: incluir ubicacion legible en la alerta
+    ubicacion_ctx = ""
+    if lat is not None and lng is not None:
+        loc = reverse_geocode(lat, lng)
+        if loc:
+            ubicacion_ctx = f"\n- Ubicacion: {loc}"
+
     prompt = f"""Genera alerta de velocidad:
 - Vehiculo: {vehicle_label}
 - Patente: {plate_clean}
 - Velocidad: {speed:.0f} km/h | Limite: {limit:.0f} km/h | Exceso: {exceso:.0f} km/h
-- Zona: {zone} | Alertas hoy: {len(alertas_hoy)}{clima_ctx}{trafico_ctx}
+- Zona: {zone} | Alertas hoy: {len(alertas_hoy)}{ubicacion_ctx}{clima_ctx}{trafico_ctx}
 
-Responder corto, SIN links de Maps.
+Responder corto, incluir ubicacion si se provee.
 Responde SOLO con JSON: {{"admin": "...", "severity": "baja|media|alta"}}"""
 
     try:
@@ -1115,6 +1231,12 @@ def generar_reporte_horario(vehicles):
     parados_count = 0
 
     for v in vehicles:
+        # FIX: saltar vehiculos con GPS congelado o excluidos temporalmente
+        if is_gps_temp_excluded(v):
+            continue
+        if is_position_stale(v.get("last_update", ""), STALE_POSITION_MINUTES):
+            continue
+
         spd = v["speed_kmh"]
         limit, zone = get_speed_limit(v)
 
@@ -1148,7 +1270,8 @@ def generar_reporte_horario(vehicles):
     for v in en_movimiento:
         exceso_tag = f" ⚠️ excede {v['limit']}km/h" if v["speed_kmh"] > v["limit"] else ""
         msg += f"  · {display_name(v['plate'], v.get('name'))} - {v['speed_kmh']:.0f}km/h{exceso_tag}\n"
-        msg += f"    Ubic.: {format_coords(v['lat'], v['lng'])}\n"
+        # FIX: usar geocodificacion inversa en reportes
+        msg += f"    Ubic.: {format_location(v['lat'], v['lng'])}\n"
 
     if ralenti_hora:
         msg += "\n*Ralenti última hora*\n"
@@ -1170,6 +1293,12 @@ def generar_reporte_movimientos_nocturno(vehicles):
             continue
         if is_after_hours_excluded(v):
             continue
+        # FIX: saltar GPS congelados y excluidos temporales
+        if is_gps_temp_excluded(v):
+            continue
+        if is_position_stale(v.get("last_update", ""), STALE_POSITION_MINUTES):
+            continue
+
         if v["speed_kmh"] > MOVEMENT_MIN_SPEED:
             limit, zone = get_speed_limit(v)
             en_movimiento.append({**v, "limit": limit, "zone": zone})
@@ -1183,7 +1312,8 @@ def generar_reporte_movimientos_nocturno(vehicles):
     for v in en_movimiento:
         exceso_tag = f" ⚠️ excede {v['limit']}km/h" if v["speed_kmh"] > v["limit"] else ""
         msg += f"  · {display_name(v['plate'], v.get('name'))} - {v['speed_kmh']:.0f}km/h{exceso_tag}\n"
-        msg += f"    Ubic.: {format_coords(v['lat'], v['lng'])}\n"
+        # FIX: geocodificacion inversa
+        msg += f"    Ubic.: {format_location(v['lat'], v['lng'])}\n"
 
     return msg
 
@@ -1318,31 +1448,116 @@ def create_webhook_app():
                     respuesta = generar_reporte_movimientos_nocturno(vehicles) or "Sin vehículos en movimiento en este momento."
                 else:
                     respuesta = generar_reporte_horario(vehicles) or "Sin vehículos en movimiento en este momento."
+
             elif any(x in body_lower for x in ["cierre", "jornada", "18hs"]):
                 respuesta = generar_reporte_cierre_18(devices, now_local().date())
+
             elif "resumen" in body_lower:
                 respuesta = ia_resumen_diario()
+
             elif any(x in body_lower for x in ["clima", "tiempo", "lluvia"]):
                 w = get_weather(-32.16, -64.10)
                 respuesta = format_weather_short(w) if w else "Sin datos de clima"
+
             elif any(x in body_lower for x in ["trafico", "transito"]):
                 incidents = get_traffic_incidents(-32.16, -64.10)
                 if incidents:
                     respuesta = format_traffic_short(incidents) or "Sin incidentes de trafico"
                 else:
                     respuesta = "Sin datos de trafico (verificar TOMTOM_API_KEY)"
+
+            # FIX: nuevo comando "donde esta [patente]"
+            elif body_lower.startswith("donde"):
+                words = body_lower.split()
+                plate_query = normalize_plate(words[-1]) if len(words) > 1 else ""
+                found = None
+                for v in vehicles:
+                    if plate_query and plate_query in normalize_plate(v.get("plate", "")):
+                        found = v
+                        break
+                    if plate_query and plate_query in normalize_plate(v.get("name", "")):
+                        found = v
+                        break
+
+                if found:
+                    stale = is_position_stale(found.get("last_update", ""), STALE_POSITION_MINUTES)
+                    stale_tag = " ⚠️ GPS sin señal reciente" if stale else ""
+                    loc = format_location(found["lat"], found["lng"])
+                    respuesta = (
+                        f"📍 {display_name(found['plate'], found.get('name'))}\n"
+                        f"  · Ubic.: {loc}\n"
+                        f"  · Vel.: {found['speed_kmh']:.0f} km/h\n"
+                        f"  · Última pos.: {hhmm(found.get('last_update'))}{stale_tag}\n"
+                        f"  · Maps: https://maps.google.com/?q={found['lat']:.5f},{found['lng']:.5f}"
+                    )
+                else:
+                    respuesta = f"No encontré vehículo con '{plate_query}'. Verificá la patente."
+
+            # FIX: nuevo comando "excluir [patente]" — exclusion temporal en memoria
+            elif body_lower.startswith("excluir"):
+                words = body.split()
+                plate_exc = normalize_plate(words[-1]) if len(words) > 1 else ""
+                if plate_exc:
+                    GPS_EXCLUIDOS_TEMPORALES.add(plate_exc)
+                    respuesta = f"✅ {plate_exc} excluido temporalmente del monitoreo. Para reactivar usá 'activar {plate_exc}'."
+                else:
+                    respuesta = "Formato: excluir [patente]. Ej: excluir ABC123"
+
+            # FIX: nuevo comando "activar [patente]"
+            elif body_lower.startswith("activar"):
+                words = body.split()
+                plate_act = normalize_plate(words[-1]) if len(words) > 1 else ""
+                if plate_act and plate_act in GPS_EXCLUIDOS_TEMPORALES:
+                    GPS_EXCLUIDOS_TEMPORALES.discard(plate_act)
+                    respuesta = f"✅ {plate_act} reactivado en el monitoreo."
+                elif plate_act:
+                    respuesta = f"{plate_act} no estaba excluido."
+                else:
+                    respuesta = "Formato: activar [patente]. Ej: activar ABC123"
+
+            # FIX: nuevo comando "velocidades" — ranking de excesos del dia
+            elif any(x in body_lower for x in ["velocidades", "excesos", "ranking"]):
+                alertas_hoy = _leer_alertas_csv_hoy()
+                if alertas_hoy:
+                    lines = ["*🏎️ Ranking velocidades hoy*"]
+                    sorted_alertas = sorted(alertas_hoy.items(), key=lambda x: x[1]["max_vel"], reverse=True)
+                    for i, (p, d) in enumerate(sorted_alertas[:10], 1):
+                        lines.append(f"  {i}. {p} — max {d['max_vel']:.0f}km/h a las {d['hora']} ({d['cantidad']} alertas)")
+                    respuesta = "\n".join(lines)
+                else:
+                    respuesta = "Sin alertas de velocidad registradas hoy."
+
+            # FIX: nuevo comando "alertas hoy"
+            elif any(x in body_lower for x in ["alertas", "incidencias"]):
+                hora_actual = now_local().strftime("%H:%M")
+                alertas_hoy = _leer_alertas_csv_hoy()
+                bloque, _ = _construir_bloque_alertas(alertas_hoy, hora_actual)
+                respuesta = bloque
+
+            elif any(x in body_lower for x in ["excluidos", "gps roto"]):
+                if GPS_EXCLUIDOS_TEMPORALES:
+                    respuesta = "Vehículos excluidos temporalmente:\n" + "\n".join(f"  · {p}" for p in sorted(GPS_EXCLUIDOS_TEMPORALES))
+                else:
+                    respuesta = "No hay vehículos excluidos temporalmente."
+
             elif any(x in body_lower for x in ["ayuda", "comandos"]):
                 respuesta = (
                     "Comandos disponibles:\n"
-                    "- reporte: muestra solo los vehículos en movimiento\n"
-                    "- cierre / jornada / 18hs: inicio, fin, viajes y paradas\n"
-                    "- resumen: resumen del día\n"
-                    "- clima: condiciones actuales\n"
+                    "- reporte: vehículos en movimiento\n"
+                    "- cierre / jornada / 18hs: resumen del día\n"
+                    "- resumen: resumen IA del día\n"
+                    "- velocidades: ranking de excesos\n"
+                    "- alertas: incidencias de hoy\n"
+                    "- donde [patente]: ubicación de un vehículo\n"
+                    "- excluir [patente]: excluir GPS roto temporalmente\n"
+                    "- activar [patente]: reactivar vehículo excluido\n"
+                    "- excluidos: lista de excluidos actuales\n"
+                    "- clima: condiciones meteorológicas\n"
                     "- trafico: incidentes viales\n"
                     "- ayuda: esta lista"
                 )
             else:
-                respuesta = "Mensaje recibido. Comandos: reporte, cierre, resumen, clima, trafico, ayuda"
+                respuesta = "Mensaje recibido. Comandos: reporte, cierre, resumen, velocidades, alertas, donde [patente], excluir [patente], ayuda"
 
             try:
                 send_whatsapp(twilio_cl, from_number, respuesta)
@@ -1388,7 +1603,13 @@ def main():
     last_summary_date = state_get_date(state, "last_summary_date")
     last_cierre_18_date = state_get_date(state, "last_cierre_18_date")
 
-    print("\nAgente RutaSat v1.9 corriendo")
+    # FIX: restaurar daily_events del estado persistido
+    global daily_events
+    daily_events = load_daily_events_from_state(state)
+    if daily_events:
+        print(f"  Estado restaurado: {len(daily_events)} eventos del dia cargados")
+
+    print("\nAgente RutaSat v2.0 corriendo")
     print(f"  Poll: {POLL_SECONDS}s | Ruta: {LIMITE_RUTA}km/h | Urbano: {LIMITE_URBANO}km/h | Ruta-110: 110km/h")
     if PATENTES_110:
         print(f"  Vehiculos 110km/h - Patentes: {', '.join(sorted(PATENTES_110))}")
@@ -1403,10 +1624,13 @@ def main():
     print(f"  Uso fuera de horario: {AFTER_HOURS_START} a {AFTER_HOURS_END}")
     print(f"  Ralenti excluido para: {', '.join(sorted(RALENTI_EXCLUIDOS_MATCH))}")
     print(f"  Fuera de horario excluido para: {', '.join(sorted(AFTER_HOURS_EXCLUIDOS_MATCH))}")
+    print(f"  GPS excluidos temporales: {', '.join(sorted(GPS_EXCLUIDOS_TEMPORALES)) or 'ninguno'}")
     print(f"  Estado persistente: {STATE_FILE}")
     print(f"  Exceso de velocidad sostenido: {SPEED_EXCEED_MINUTES} min")
+    print(f"  Alerta GPS sin señal: {STALE_ALERT_HOURS}hs")
     print(f"  Clima cache TTL: {WEATHER_CACHE_TTL}s | backoff 429: {WEATHER_BACKOFF_SECONDS}s")
     print(f"  Posicion vieja: {STALE_POSITION_MINUTES} min")
+    print(f"  Geocodificacion inversa: Nominatim (gratis)")
     print()
 
     global last_hourly_report
@@ -1490,6 +1714,23 @@ def main():
                     dname = display_name(plate, v.get("name"))
                     pos_stale = is_position_stale(last_update, STALE_POSITION_MINUTES)
 
+                    # FIX: saltar completamente vehiculos excluidos temporalmente
+                    if is_gps_temp_excluded(v):
+                        continue
+
+                    # FIX: alerta de GPS sin señal prolongada
+                    if pos_stale:
+                        last_stale_alert = stale_alerted.get(state_key, 0)
+                        if (ahora_ts - last_stale_alert) > (STALE_ALERT_HOURS * 3600):
+                            stale_alerted[state_key] = ahora_ts
+                            stale_msg = (
+                                f"📡 GPS sin señal: {dname}\n"
+                                f"  · Última pos.: {hhmm(last_update)}\n"
+                                f"  · Para excluirlo temporalmente: excluir {plate}"
+                            )
+                            send_to_admins(twilio, stale_msg)
+                            print(f"  GPS STALE ALERTA: {dname} ultima pos {hhmm(last_update)}")
+
                     # -------------------------------------------------------
                     # USO FUERA DE HORARIO
                     # -------------------------------------------------------
@@ -1504,7 +1745,7 @@ def main():
                                     f"· {dname}\n"
                                     f"· Hora: {hora_local.strftime('%H:%M')}\n"
                                     f"· Velocidad: {speed:.0f} km/h\n"
-                                    f"· Ubic.: {format_coords(lat, lng)}"
+                                    f"· Ubic.: {format_location(lat, lng)}"
                                 )
                                 send_to_admins(twilio, after_msg)
                                 print(f"  USO FUERA DE HORARIO: {dname} a {speed:.0f} km/h")
@@ -1661,6 +1902,9 @@ def main():
                         "limit": limit,
                         "zone": zone,
                     })
+                    # FIX: guardar daily_events en estado despues de cada alerta
+                    save_daily_events_to_state(state)
+                    save_runtime_state(state)
                     print(f"  Alerta enviada ({mensajes.get('severity', '?')})")
 
                 except Exception as e:
