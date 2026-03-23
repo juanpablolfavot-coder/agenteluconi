@@ -783,15 +783,26 @@ def _nexpro_login():
         return m.group(1) if m else ""
 
     html = r.text
+    print(f"  [NexproConnect] GET login url={r.url} status={r.status_code} html_len={len(html)}")
+
+    vs  = _extract_field("__VIEWSTATE", html)
+    vsg = _extract_field("__VIEWSTATEGENERATOR", html)
+    ev  = _extract_field("__EVENTVALIDATION", html)
+    print(f"  [NexproConnect] VS_len={len(vs)} VSG={vsg} EV_len={len(ev)}")
+
+    # Si el GET nos redirigió (ya hay sesión activa del lado del server)
+    if "login2" not in r.url.lower():
+        print(f"  [NexproConnect] GET redirigió a {r.url} — el server no acepta sesiones nuevas?")
+
     # Nombres reales de los campos (inspeccionados del HTML real del form)
     login_payload = {
         "ctl00$hdIdioma":       "1",
         "ctl00$hdUrl":          "-1",
         "__EVENTTARGET":        "",
         "__EVENTARGUMENT":      "",
-        "__VIEWSTATE":          _extract_field("__VIEWSTATE", html),
-        "__VIEWSTATEGENERATOR": _extract_field("__VIEWSTATEGENERATOR", html),
-        "__EVENTVALIDATION":    _extract_field("__EVENTVALIDATION", html),
+        "__VIEWSTATE":          vs,
+        "__VIEWSTATEGENERATOR": vsg,
+        "__EVENTVALIDATION":    ev,
         "ctl00$contenidoMaster$txtMail":  NEXPRO_EMAIL,
         "ctl00$contenidoMaster$txtClave": NEXPRO_PASSWORD,
         "ctl00$contenidoMaster$btnIr":    "Iniciar Sesión",
@@ -805,9 +816,13 @@ def _nexpro_login():
         allow_redirects=True,
     )
     r2.raise_for_status()
+    print(f"  [NexproConnect] POST login url={r2.url} status={r2.status_code}")
 
-    # Si sigue en login2 = credenciales incorrectas
+    # Si sigue en login2 = credenciales incorrectas o ViewState vacío
     if "login2" in r2.url.lower():
+        # Mostrar qué tiene el HTML de respuesta (primeros 500 chars sin sensibles)
+        preview = r2.text[:300].replace(NEXPRO_PASSWORD, "***")
+        print(f"  [NexproConnect] Login falló, respuesta preview: {preview}")
         raise RuntimeError("NexproConnect: login fallido — verificá usuario/contraseña")
 
     # 3) Cargar página de seguimiento para obtener hdPerfilUsuario real
