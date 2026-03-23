@@ -785,6 +785,8 @@ def _nexpro_login():
     html = r.text
     # Nombres reales de los campos (inspeccionados del HTML real del form)
     login_payload = {
+        "ctl00$hdIdioma":       "1",
+        "ctl00$hdUrl":          "-1",
         "__EVENTTARGET":        "",
         "__EVENTARGUMENT":      "",
         "__VIEWSTATE":          _extract_field("__VIEWSTATE", html),
@@ -792,7 +794,7 @@ def _nexpro_login():
         "__EVENTVALIDATION":    _extract_field("__EVENTVALIDATION", html),
         "ctl00$contenidoMaster$txtMail":  NEXPRO_EMAIL,
         "ctl00$contenidoMaster$txtClave": NEXPRO_PASSWORD,
-        "ctl00$contenidoMaster$btnIr":    "Ingresar",
+        "ctl00$contenidoMaster$btnIr":    "Iniciar Sesión",
     }
 
     # 2) POST de login
