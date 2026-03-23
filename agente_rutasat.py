@@ -135,11 +135,18 @@ def extract_plate_from_name(text):
     return ""
 
 
-PATENTES_110: set = {
-    "ORF347", "ORF342",
-    "AH516HY", "AH516HX",
-    "AG369ZD", "AG369ZC", "AG677LX", "AG677LW",
-}
+# Patentes con límite 110 km/h — configurable via .envvars
+# PATENTES_110=JFV681,JFV680,ORF347,...
+_patentes_110_env = os.getenv("PATENTES_110", "")
+if _patentes_110_env.strip():
+    PATENTES_110: set = set(x.strip().upper().replace(" ", "") for x in _patentes_110_env.split(",") if x.strip())
+else:
+    # fallback hardcoded — se usa si no hay variable de entorno
+    PATENTES_110: set = {
+        "JFV681", "JFV680", "ORF347", "ORF342", "KCB412",
+        "AG369ZD", "AG369ZC", "AG677LW", "AG677LX",
+        "AA706VW", "NWD463", "AH516HY", "AH516HX",
+    }
 
 NOMBRE_VEHICULO = {
     "ORF347": "Kangoo EX.1.6 #Rio Tercero",
