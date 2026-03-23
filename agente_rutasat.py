@@ -24,7 +24,7 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# CONFIG
+# CONFIG RUTASAT
 # ---------------------------------------------------------------------------
 RUTASAT_BASE_URL = "https://rutasat.com/api"
 RUTASAT_EMAIL = os.getenv("RUTASAT_EMAIL", "")
@@ -99,6 +99,38 @@ AFTER_HOURS_EXCLUIDOS_MATCH: set = {
 
 
 # ---------------------------------------------------------------------------
+# CONFIG NEXPRO CONNECT (segundo satelital — Ivecos)
+# ---------------------------------------------------------------------------
+NEXPRO_BASE_URL  = os.getenv("NEXPRO_BASE_URL", "https://nexproconnect.net/iveco")
+NEXPRO_EMAIL     = os.getenv("NEXPRO_EMAIL", "")
+NEXPRO_PASSWORD  = os.getenv("NEXPRO_PASSWORD", "")
+NEXPRO_PERFIL    = os.getenv("NEXPRO_PERFIL", "139")   # hdPerfilUsuario
+NEXPRO_IDIOMA    = os.getenv("NEXPRO_IDIOMA", "1")
+
+# Sesión persistente NexproConnect
+_nexpro_session = None
+_nexpro_seg_body: str = ""
+
+# Columnas exactas que espera el endpoint Seg/ (capturadas del request real del browser)
+_NEXPRO_COLS = (
+    '[{"UsaHTML":false,"DataField":"","Name":"Acciones","HeaderText":"Acciones",'
+    '"Type":4,"Exportar":false,"Translate":false,"ActionFormat":""},'
+    '{"UsaHTML":false,"DataField":"Dominio","Name":"Dominio","HeaderText":"Dominio",'
+    '"Type":4,"Exportar":true,"Translate":false,"ActionFormat":""},'
+    '{"UsaHTML":false,"DataField":"Modelo","Name":"Modelo","HeaderText":"Modelo",'
+    '"Type":4,"Exportar":true,"Translate":false,"ActionFormat":""},'
+    '{"UsaHTML":false,"DataField":"Fecha","Name":"Fecha","HeaderText":"Fecha",'
+    '"Type":4,"Exportar":true,"Translate":false,"ActionFormat":"dd/MM/yyyy hh:mm:ss"},'
+    '{"UsaHTML":false,"DataField":"Evento","Name":"Evento","HeaderText":"Evento",'
+    '"Type":4,"Exportar":true,"Translate":false,"ActionFormat":""},'
+    '{"UsaHTML":false,"DataField":"Odometro","Name":"Odómetro","HeaderText":"Odómetro",'
+    '"Type":4,"Exportar":true,"Translate":false,"ActionFormat":""},'
+    '{"UsaHTML":false,"DataField":"Actividad","Name":"Actividad","HeaderText":"Actividad",'
+    '"Type":4,"Exportar":false,"Translate":false,"ActionFormat":""}]'
+)
+
+
+# ---------------------------------------------------------------------------
 # UTILS DE PATENTES
 # ---------------------------------------------------------------------------
 def normalize_plate(text):
@@ -136,12 +168,10 @@ def extract_plate_from_name(text):
 
 
 # Patentes con límite 110 km/h — configurable via .envvars
-# PATENTES_110=JFV681,JFV680,ORF347,...
 _patentes_110_env = os.getenv("PATENTES_110", "")
 if _patentes_110_env.strip():
     PATENTES_110: set = set(x.strip().upper().replace(" ", "") for x in _patentes_110_env.split(",") if x.strip())
 else:
-    # fallback hardcoded — se usa si no hay variable de entorno
     PATENTES_110: set = {
         "JFV681", "JFV680", "ORF347", "ORF342", "KCB412",
         "AG369ZD", "AG369ZC", "AG677LW", "AG677LX",
@@ -231,15 +261,12 @@ speed_exceed_tracking = {}
 after_hours_motion_state = {}
 last_alert_ts = {}
 
-# FIX: rastreo de alertas por GPS congelado
-
 weather_cache = {}
 weather_rate_limited_until = 0
 
 traffic_cache = {}
 wa_session_active = {}
 
-# FIX: cache de geocodificacion inversa
 geocode_cache = {}
 
 _rutasat_token = None
@@ -284,7 +311,6 @@ def state_set_date(state, key, value_date):
     state[key] = value_date.isoformat() if value_date else None
 
 
-# FIX: persistir daily_events en el estado
 def load_daily_events_from_state(state):
     today = now_local().date().isoformat()
     saved = state.get("daily_events", {})
@@ -297,7 +323,7 @@ def save_daily_events_to_state(state):
     today = now_local().date().isoformat()
     state["daily_events"] = {
         "date": today,
-        "events": daily_events[-500:],  # limitar a ultimos 500
+        "events": daily_events[-500:],
     }
 
 
@@ -389,6 +415,32 @@ def is_position_stale(last_update, max_age_minutes=STALE_POSITION_MINUTES):
     return age.total_seconds() > (max_age_minutes * 60)
 
 
+def is_position_stale_nexpro(last_update_str, max_age_minutes=STALE_POSITION_MINUTES):
+    """
+    Versión de is_position_stale para fechas NexproConnect con formato
+    'dd/MM/yyyy HH:mm:ss' o 'dd/M/yyyy HH:mm:ss'.
+    """
+    if not last_update_str:
+        return True
+    try:
+        # Limpiar caracteres basura que puede traer el HTML
+        clean = re.sub(r"[<'>]", "", last_update_str).strip()
+        dt = datetime.strptime(clean, "%d/%m/%Y %H:%M:%S")
+        dt = dt.replace(tzinfo=timezone(timedelta(hours=-3)))
+        age = now_local() - dt
+        return age.total_seconds() > (max_age_minutes * 60)
+    except Exception:
+        # Intentar con formato corto de mes
+        try:
+            clean = re.sub(r"[<'>]", "", last_update_str).strip()
+            dt = datetime.strptime(clean, "%d/%m/%Y %H:%M:%S")
+            dt = dt.replace(tzinfo=timezone(timedelta(hours=-3)))
+            age = now_local() - dt
+            return age.total_seconds() > (max_age_minutes * 60)
+        except Exception:
+            return True
+
+
 def vehicle_state_key(vehicle):
     device_id = vehicle.get("device_id")
     if device_id is not None and str(device_id).strip():
@@ -459,7 +511,6 @@ def is_after_hours_excluded(vehicle):
 
 
 def is_gps_temp_excluded(vehicle):
-    """FIX: chequea si el vehiculo esta excluido temporalmente por GPS roto."""
     plate = normalize_plate(vehicle.get("plate", ""))
     name = normalize_plate(vehicle.get("name", ""))
     for token in GPS_EXCLUIDOS_TEMPORALES:
@@ -513,13 +564,12 @@ def split_whatsapp_text(text, limit=MAX_WA_BODY):
 # ---------------------------------------------------------------------------
 # GEOCODIFICACION INVERSA (Nominatim — gratis, sin API key)
 # ---------------------------------------------------------------------------
-GEOCODE_CACHE_TTL = 86400  # 24 horas, las calles no cambian
-GEOCODE_PRECISION = 3      # redondear a ~100m para maximizar cache hits
+GEOCODE_CACHE_TTL = 86400
+GEOCODE_PRECISION = 3
 GEOCODE_TIMEOUT = 5
 
 
 def reverse_geocode(lat, lng):
-    """Devuelve string legible como 'Ruta 9, Villa Maria' o None si falla."""
     lat_r = round(float(lat), GEOCODE_PRECISION)
     lng_r = round(float(lng), GEOCODE_PRECISION)
     cache_key = f"{lat_r},{lng_r}"
@@ -571,7 +621,6 @@ def reverse_geocode(lat, lng):
 
 
 def format_location(lat, lng):
-    """Devuelve nombre de lugar si disponible, sino coordenadas."""
     name = reverse_geocode(lat, lng)
     if name:
         return name
@@ -715,6 +764,271 @@ def build_devices_lookup_by_plate(devices):
 
 
 # ---------------------------------------------------------------------------
+# NEXPRO CONNECT API (segundo satelital — Ivecos Tector)
+# ---------------------------------------------------------------------------
+def _nexpro_login():
+    """Hace login en NexproConnect y deja la sesión lista en _nexpro_session."""
+    global _nexpro_session, _nexpro_seg_body
+
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0 RutaSat-Monitor/2.0"})
+
+    # 1) GET login para obtener ViewState y campos ASP.NET
+    r = s.get(f"{NEXPRO_BASE_URL}/Login/login2.aspx", timeout=20)
+    r.raise_for_status()
+
+    def _extract_field(name, html):
+        m = (re.search(rf'id="{name}"[^>]*value="([^"]*)"', html) or
+             re.search(rf'name="{name}"[^>]*value="([^"]*)"', html))
+        return m.group(1) if m else ""
+
+    html = r.text
+    login_payload = {
+        "__VIEWSTATE":          _extract_field("__VIEWSTATE", html),
+        "__VIEWSTATEGENERATOR": _extract_field("__VIEWSTATEGENERATOR", html),
+        "__EVENTVALIDATION":    _extract_field("__EVENTVALIDATION", html),
+        "txtUsuario":           NEXPRO_EMAIL,
+        "txtContrasenia":       NEXPRO_PASSWORD,
+        "btnEntrar":            "Entrar",
+    }
+
+    # 2) POST de login
+    r2 = s.post(
+        f"{NEXPRO_BASE_URL}/Login/login2.aspx",
+        data=login_payload,
+        timeout=20,
+        allow_redirects=True,
+    )
+    r2.raise_for_status()
+
+    if "login2" in r2.url.lower():
+        raise RuntimeError("NexproConnect: login fallido — verificá usuario/contraseña")
+
+    # 3) Cargar página de seguimiento para obtener hdPerfilUsuario real
+    r3 = s.get(f"{NEXPRO_BASE_URL}/MapServer/Seguimiento2.aspx", timeout=20)
+    r3.raise_for_status()
+
+    html3 = r3.text
+    m_perfil = re.search(r'hdPerfilUsuario["\s]+value="(\d+)"', html3)
+    perfil = m_perfil.group(1) if m_perfil else NEXPRO_PERFIL
+
+    # 4) Armar el body completo para el endpoint Seg/ (copiado del request real)
+    _nexpro_seg_body = (
+        f"cols={requests.utils.quote(_NEXPRO_COLS)}"
+        f"&tg="
+        f"&hdIdioma={NEXPRO_IDIOMA}"
+        f"&hdUrl=-1"
+        f"&idEmpresa=-1"
+        f"&idPais=-1"
+        f"&idProvincia=-1"
+        f"&chkAct=on"
+        f"&ctl00_contenidoMaster_ctlViasFerrobaires_hdtreelist=-1"
+        f"&hdPerfilUsuario={perfil}"
+        f"&hdidIdioma={NEXPRO_IDIOMA}"
+        f"&pk="
+        f"&textField="
+        f"&dataTextField="
+        f"&GridID=GridSeguimiento"
+    )
+
+    _nexpro_session = s
+    print(f"  [NexproConnect] Login OK (perfil={perfil})")
+    return s
+
+
+def _nexpro_get_session():
+    global _nexpro_session
+    if _nexpro_session is None:
+        _nexpro_login()
+    return _nexpro_session
+
+
+def _nexpro_parse_positions(raw: str) -> dict:
+    """
+    Parsea la respuesta del endpoint Post con accion=todos.
+
+    Formato por vehículo separado por '|':
+        lat;lng;velocidad;rumbo;fecha;odometro;?;estado;dominio;conductor;;device_id;<HTML>...
+
+    Devuelve dict {PATENTE: {lat, lng, speed_kmh, estado, fecha, device_id}}
+    """
+    positions = {}
+    if not raw:
+        return positions
+
+    for entry in raw.split("|"):
+        entry = entry.strip()
+        if not entry:
+            continue
+
+        # Tomar primera línea (datos separados por ';')
+        first_line = entry.split("\n")[0].strip()
+        parts = first_line.split(";")
+
+        if len(parts) < 9:
+            continue
+
+        try:
+            lat   = float(parts[0])
+            lng   = float(parts[1])
+            speed = float(parts[2]) if parts[2] else 0.0
+        except ValueError:
+            continue
+
+        fecha     = parts[4].strip() if len(parts) > 4 else ""
+        estado    = parts[7].strip() if len(parts) > 7 else ""
+        dominio   = parts[8].strip() if len(parts) > 8 else ""
+        device_id = parts[11].strip() if len(parts) > 11 else ""
+
+        if dominio:
+            plate = normalize_plate(dominio)
+            positions[plate] = {
+                "lat":       lat,
+                "lng":       lng,
+                "speed_kmh": speed,
+                "estado":    estado,
+                "fecha":     fecha,
+                "device_id": device_id,
+            }
+
+    return positions
+
+
+def _nexpro_get_positions() -> dict:
+    """Llama al endpoint Post accion=todos y devuelve posiciones GPS."""
+    s = _nexpro_get_session()
+    try:
+        r = s.post(
+            f"{NEXPRO_BASE_URL}/api/Seguimiento_Ajax/Post",
+            data={
+                "accion":      "todos",
+                "idPais":      "-1",
+                "idProvincia": "-1",
+                "idEmpresa":   "-1",
+            },
+            headers={"X-Requested-With": "XMLHttpRequest"},
+            timeout=20,
+        )
+        if r.status_code in (401, 403) or (r.status_code == 200 and len(r.text) < 5):
+            raise RuntimeError(f"Sesión NexproConnect expirada (status={r.status_code})")
+        r.raise_for_status()
+        return _nexpro_parse_positions(r.text)
+
+    except RuntimeError:
+        # Re-login automático
+        global _nexpro_session
+        _nexpro_session = None
+        _nexpro_login()
+        r2 = _nexpro_session.post(
+            f"{NEXPRO_BASE_URL}/api/Seguimiento_Ajax/Post",
+            data={"accion": "todos", "idPais": "-1", "idProvincia": "-1", "idEmpresa": "-1"},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+            timeout=20,
+        )
+        r2.raise_for_status()
+        return _nexpro_parse_positions(r2.text)
+
+    except Exception as e:
+        print(f"  [NexproConnect] Error positions: {e}")
+        return {}
+
+
+def get_nexpro_vehicles() -> list:
+    """
+    Obtiene vehículos de NexproConnect con posición GPS en tiempo real.
+    Devuelve lista con la misma estructura que build_vehicle_list() de RutaSat.
+    Retorna [] si NEXPRO_EMAIL no está configurado.
+    """
+    if not NEXPRO_EMAIL or not NEXPRO_PASSWORD:
+        return []
+
+    global _nexpro_session, _nexpro_seg_body
+
+    s = _nexpro_get_session()
+
+    # 1) Lista de vehículos desde el grid
+    try:
+        r = s.post(
+            f"{NEXPRO_BASE_URL}/api/Seguimiento_Ajax/Seg/",
+            data=_nexpro_seg_body,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=25,
+        )
+
+        # Detectar sesión expirada
+        if (r.status_code in (302, 401, 403) or
+                "login" in r.url.lower() or
+                (r.status_code == 200 and len(r.text) < 10)):
+            _nexpro_session = None
+            _nexpro_login()
+            return get_nexpro_vehicles()
+
+        r.raise_for_status()
+        grid = r.json()
+
+    except Exception as e:
+        print(f"  [NexproConnect] Error Seg/: {e}")
+        return []
+
+    rows = grid.get("aaData", [])
+    if not rows:
+        print("  [NexproConnect] Sin vehículos en aaData")
+        return []
+
+    # 2) Posiciones GPS en tiempo real
+    positions = _nexpro_get_positions()
+
+    # 3) Construir lista
+    vehicles = []
+    for row in rows:
+        # col[0]: botones HTML — el device_id está en el onclick de historico2
+        html_col0  = row[0] if len(row) > 0 else ""
+        m_uid      = re.search(r"historico2\((\d+),", html_col0)
+        device_num = m_uid.group(1) if m_uid else ""
+
+        plate_raw   = str(row[1]).strip() if len(row) > 1 else ""
+        model       = str(row[2]).strip() if len(row) > 2 else ""
+        last_update = re.sub(r"[<'>]", "", str(row[3])).strip() if len(row) > 3 else ""
+        estado_grid = str(row[4]).strip() if len(row) > 4 else ""
+
+        if not plate_raw:
+            continue
+
+        plate = normalize_plate(plate_raw)
+
+        # Posición GPS del endpoint Post
+        pos       = positions.get(plate, {})
+        lat       = pos.get("lat", 0.0)
+        lng       = pos.get("lng", 0.0)
+        speed_kmh = pos.get("speed_kmh", 0.0)
+        estado    = pos.get("estado", estado_grid)
+        fecha     = pos.get("fecha", last_update)
+
+        # Ignición: True si no está Parado ni en modo sleep
+        ignition = estado.lower() not in (
+            "parado", "reporte modo sleep", "sin señal", ""
+        )
+
+        vehicles.append({
+            "plate":       plate,
+            "device_id":   f"nexpro_{device_num or plate}",
+            "name":        f"{plate} ({model})" if model else plate,
+            "lat":         lat,
+            "lng":         lng,
+            "speed_kmh":   speed_kmh,
+            "ignition":    ignition,
+            "last_update": fecha,
+            "_source":     "nexpro",
+        })
+
+    print(f"  [NexproConnect] {len(vehicles)} vehículos OK")
+    return vehicles
+
+
+# ---------------------------------------------------------------------------
 # WHATSAPP (Twilio)
 # ---------------------------------------------------------------------------
 def _send_single_whatsapp(client, to, body, has_session):
@@ -798,7 +1112,6 @@ def log_event(row, path=LOG_PATH):
             writer.writeheader()
         writer.writerow(payload)
 
-    # También persistir en SQLite si analytics está activo
     if ANALYTICS_AVAILABLE:
         try:
             an = get_analytics()
@@ -816,7 +1129,7 @@ def log_event(row, path=LOG_PATH):
                     severity=str(row.get("severity", "media")),
                 )
         except Exception as _e:
-            pass  # analytics falla silenciosamente
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1062,7 +1375,6 @@ def init_claude():
     else:
         print("  Sin ANTHROPIC_API_KEY -- modo basico")
 
-    # Inicializar analytics (migra CSV si existe)
     if ANALYTICS_AVAILABLE:
         init_analytics(
             claude_client=claude_client,
@@ -1102,7 +1414,6 @@ def ia_generar_alerta(plate, speed, limit, zone, lat=None, lng=None, raw_name=No
         if incidents and has_significant_traffic(incidents):
             trafico_ctx = f"\n- TRAFICO: {format_traffic_short(incidents)}"
 
-    # FIX: incluir ubicacion legible en la alerta
     ubicacion_ctx = ""
     if lat is not None and lng is not None:
         loc = reverse_geocode(lat, lng)
@@ -1275,7 +1586,6 @@ def generar_reporte_horario(vehicles):
     parados_count = 0
 
     for v in vehicles:
-        # FIX: saltar vehiculos con GPS congelado o excluidos temporalmente
         if is_gps_temp_excluded(v):
             continue
         if is_position_stale(v.get("last_update", ""), STALE_POSITION_MINUTES):
@@ -1313,8 +1623,8 @@ def generar_reporte_horario(vehicles):
     msg += "\n*En Movimiento* 🚗\n"
     for v in en_movimiento:
         exceso_tag = f" ⚠️ excede {v['limit']}km/h" if v["speed_kmh"] > v["limit"] else ""
-        msg += f"  · {display_name(v['plate'], v.get('name'))} - {v['speed_kmh']:.0f}km/h{exceso_tag}\n"
-        # FIX: usar geocodificacion inversa en reportes
+        fuente_tag = " [NX]" if v.get("_source") == "nexpro" else ""
+        msg += f"  · {display_name(v['plate'], v.get('name'))}{fuente_tag} - {v['speed_kmh']:.0f}km/h{exceso_tag}\n"
         msg += f"    Ubic.: {format_location(v['lat'], v['lng'])}\n"
 
     if ralenti_hora:
@@ -1337,7 +1647,6 @@ def generar_reporte_movimientos_nocturno(vehicles):
             continue
         if is_after_hours_excluded(v):
             continue
-        # FIX: saltar GPS congelados y excluidos temporales
         if is_gps_temp_excluded(v):
             continue
         if is_position_stale(v.get("last_update", ""), STALE_POSITION_MINUTES):
@@ -1355,8 +1664,8 @@ def generar_reporte_movimientos_nocturno(vehicles):
 
     for v in en_movimiento:
         exceso_tag = f" ⚠️ excede {v['limit']}km/h" if v["speed_kmh"] > v["limit"] else ""
-        msg += f"  · {display_name(v['plate'], v.get('name'))} - {v['speed_kmh']:.0f}km/h{exceso_tag}\n"
-        # FIX: geocodificacion inversa
+        fuente_tag = " [NX]" if v.get("_source") == "nexpro" else ""
+        msg += f"  · {display_name(v['plate'], v.get('name'))}{fuente_tag} - {v['speed_kmh']:.0f}km/h{exceso_tag}\n"
         msg += f"    Ubic.: {format_location(v['lat'], v['lng'])}\n"
 
     return msg
@@ -1482,12 +1791,18 @@ def create_webhook_app():
                 devices = get_devices()
                 positions = get_positions()
                 vehicles = build_vehicle_list(devices, positions)
+                # Agregar Ivecos NexproConnect
+                try:
+                    nexpro_v = get_nexpro_vehicles()
+                    vehicles = vehicles + nexpro_v
+                except Exception as _ne:
+                    print(f"  [NexproConnect] Error en webhook: {_ne}")
             except Exception as e:
                 devices = []
                 vehicles = []
                 print(f"  Error GPS: {e}")
 
-            # Config dinámica — debe ir primero para capturar "config ..."
+            # Config dinámica
             if ANALYTICS_AVAILABLE:
                 an = get_analytics()
                 dynconfig = an.get("dynconfig")
@@ -1523,7 +1838,6 @@ def create_webhook_app():
                 else:
                     respuesta = "Sin datos de trafico (verificar TOMTOM_API_KEY)"
 
-            # FIX: nuevo comando "donde esta [patente]"
             elif body_lower.startswith("donde"):
                 words = body_lower.split()
                 plate_query = normalize_plate(words[-1]) if len(words) > 1 else ""
@@ -1539,18 +1853,18 @@ def create_webhook_app():
                 if found:
                     stale = is_position_stale(found.get("last_update", ""), STALE_POSITION_MINUTES)
                     stale_tag = " ⚠️ GPS sin señal reciente" if stale else ""
+                    fuente_tag = " [NexproConnect]" if found.get("_source") == "nexpro" else " [RutaSat]"
                     loc = format_location(found["lat"], found["lng"])
                     respuesta = (
-                        f"📍 {display_name(found['plate'], found.get('name'))}\n"
+                        f"📍 {display_name(found['plate'], found.get('name'))}{fuente_tag}\n"
                         f"  · Ubic.: {loc}\n"
                         f"  · Vel.: {found['speed_kmh']:.0f} km/h\n"
-                        f"  · Última pos.: {hhmm(found.get('last_update'))}{stale_tag}\n"
+                        f"  · Última pos.: {found.get('last_update', '--:--')}{stale_tag}\n"
                         f"  · Maps: https://maps.google.com/?q={found['lat']:.5f},{found['lng']:.5f}"
                     )
                 else:
                     respuesta = f"No encontré vehículo con '{plate_query}'. Verificá la patente."
 
-            # FIX: nuevo comando "excluir [patente]" — exclusion temporal en memoria
             elif body_lower.startswith("excluir"):
                 words = body.split()
                 plate_exc = normalize_plate(words[-1]) if len(words) > 1 else ""
@@ -1560,8 +1874,6 @@ def create_webhook_app():
                 else:
                     respuesta = "Formato: excluir [patente]. Ej: excluir ABC123"
 
-
-            # FIX: nuevo comando "activar [patente]"
             elif body_lower.startswith("activar"):
                 words = body.split()
                 plate_act = normalize_plate(words[-1]) if len(words) > 1 else ""
@@ -1573,7 +1885,6 @@ def create_webhook_app():
                 else:
                     respuesta = "Formato: activar [patente]. Ej: activar ABC123"
 
-            # FIX: nuevo comando "velocidades" — ranking de excesos del dia
             elif any(x in body_lower for x in ["velocidades", "excesos", "ranking"]):
                 alertas_hoy = _leer_alertas_csv_hoy()
                 if alertas_hoy:
@@ -1585,7 +1896,6 @@ def create_webhook_app():
                 else:
                     respuesta = "Sin alertas de velocidad registradas hoy."
 
-            # FIX: nuevo comando "alertas hoy"
             elif any(x in body_lower for x in ["alertas", "incidencias"]):
                 hora_actual = now_local().strftime("%H:%M")
                 alertas_hoy = _leer_alertas_csv_hoy()
@@ -1598,12 +1908,10 @@ def create_webhook_app():
                 else:
                     respuesta = "No hay vehículos excluidos temporalmente."
 
-            # Perfil de conductor
             elif body_lower.startswith("perfil"):
                 if ANALYTICS_AVAILABLE:
                     words = body.split()
                     plate_q = normalize_plate(words[-1]) if len(words) > 1 else ""
-                    # buscar patente en vehículos activos
                     found_plate = None
                     for v in vehicles:
                         if plate_q and plate_q in normalize_plate(v.get("plate", "")):
@@ -1623,7 +1931,6 @@ def create_webhook_app():
                 else:
                     respuesta = "Analytics no disponible. Verificar analytics.py."
 
-            # Reporte semanal on-demand
             elif any(x in body_lower for x in ["semanal", "semana"]):
                 if ANALYTICS_AVAILABLE:
                     an = get_analytics()
@@ -1638,7 +1945,6 @@ def create_webhook_app():
                 else:
                     respuesta = "Analytics no disponible."
 
-            # Ranking de riesgo
             elif any(x in body_lower for x in ["ranking", "riesgo", "conductores"]):
                 if ANALYTICS_AVAILABLE:
                     an = get_analytics()
@@ -1669,7 +1975,6 @@ def create_webhook_app():
                 else:
                     respuesta = "Analytics no disponible."
 
-            # Estimación de combustible
             elif any(x in body_lower for x in ["combustible", "consumo", "nafta"]):
                 if ANALYTICS_AVAILABLE:
                     an = get_analytics()
@@ -1706,6 +2011,7 @@ def create_webhook_app():
                     "  ej: config vel_ruta 90 | config ralenti 8"
                 ) if ANALYTICS_AVAILABLE else ""
 
+                nexpro_status = " ✅" if NEXPRO_EMAIL else " ❌ (no configurado)"
                 respuesta = (
                     "Comandos disponibles:\n"
                     "- reporte: vehículos en movimiento\n"
@@ -1718,6 +2024,9 @@ def create_webhook_app():
                     "- clima: condiciones meteorológicas\n"
                     "- trafico: incidentes viales\n"
                     + analytics_cmds +
+                    f"\n\n📡 Fuentes GPS:\n"
+                    f"- RutaSat ✅\n"
+                    f"- NexproConnect (Ivecos){nexpro_status}\n"
                     "\n- ayuda: esta lista"
                 )
             else:
@@ -1767,13 +2076,12 @@ def main():
     last_summary_date = state_get_date(state, "last_summary_date")
     last_cierre_18_date = state_get_date(state, "last_cierre_18_date")
 
-    # FIX: restaurar daily_events del estado persistido
     global daily_events
     daily_events = load_daily_events_from_state(state)
     if daily_events:
         print(f"  Estado restaurado: {len(daily_events)} eventos del dia cargados")
 
-    print("\nAgente RutaSat v2.0 corriendo")
+    print("\nAgente RutaSat v2.1 + NexproConnect corriendo")
     print(f"  Poll: {POLL_SECONDS}s | Ruta: {LIMITE_RUTA}km/h | Urbano: {LIMITE_URBANO}km/h | Ruta-110: 110km/h")
     if PATENTES_110:
         print(f"  Vehiculos 110km/h - Patentes: {', '.join(sorted(PATENTES_110))}")
@@ -1794,6 +2102,7 @@ def main():
     print(f"  Clima cache TTL: {WEATHER_CACHE_TTL}s | backoff 429: {WEATHER_BACKOFF_SECONDS}s")
     print(f"  Posicion vieja: {STALE_POSITION_MINUTES} min")
     print(f"  Geocodificacion inversa: Nominatim (gratis)")
+    print(f"  NexproConnect (Ivecos): {'Configurado ✓' if NEXPRO_EMAIL else 'No configurado (agregar NEXPRO_EMAIL/PASSWORD en .envvars)'}")
     print()
 
     global last_hourly_report
@@ -1812,7 +2121,6 @@ def main():
                     last_summary_date = today
                     state_set_date(state, "last_summary_date", today)
 
-                    # Calcular perfiles de riesgo del día
                     if ANALYTICS_AVAILABLE:
                         try:
                             an = get_analytics()
@@ -1847,15 +2155,26 @@ def main():
                     except Exception as e:
                         print(f"  Error reporte semanal: {e}")
 
+            # --- Obtener vehículos de ambas fuentes ---
             try:
                 devices = get_devices()
                 positions = get_positions()
                 vehicles = build_vehicle_list(devices, positions)
 
+                # Agregar Ivecos de NexproConnect
+                try:
+                    nexpro_v = get_nexpro_vehicles()
+                    vehicles = vehicles + nexpro_v
+                except Exception as _ne:
+                    print(f"  [NexproConnect] Error: {_ne}")
+
                 active_state_keys = {vehicle_state_key(v) for v in vehicles}
                 cleanup_missing_vehicle_states(active_state_keys)
 
-                print(f"  Vehiculos: {len(vehicles)}", flush=True)
+                rutasat_count = len([v for v in vehicles if v.get("_source") != "nexpro"])
+                nexpro_count  = len([v for v in vehicles if v.get("_source") == "nexpro"])
+                print(f"  Vehiculos: {len(vehicles)} (RutaSat={rutasat_count} | NexproConnect={nexpro_count})", flush=True)
+
             except Exception as e:
                 print(f"  Error GPS: {e}")
                 time.sleep(30)
@@ -1907,7 +2226,6 @@ def main():
                     dname = display_name(plate, v.get("name"))
                     pos_stale = is_position_stale(last_update, STALE_POSITION_MINUTES)
 
-                    # FIX: saltar completamente vehiculos excluidos temporalmente
                     if is_gps_temp_excluded(v):
                         continue
 
@@ -1935,10 +2253,9 @@ def main():
                         except Exception as _ae:
                             pass
 
-
-                    # -------------------------------------------------------
+                    # ---------------------------------------------------
                     # USO FUERA DE HORARIO
-                    # -------------------------------------------------------
+                    # ---------------------------------------------------
                     if is_after_hours_excluded(v):
                         after_hours_motion_state.pop(state_key, None)
                     elif is_after_hours(hora_local):
@@ -1959,9 +2276,9 @@ def main():
                     else:
                         after_hours_motion_state.pop(state_key, None)
 
-                    # -------------------------------------------------------
+                    # ---------------------------------------------------
                     # RALENTI
-                    # -------------------------------------------------------
+                    # ---------------------------------------------------
                     if pos_stale:
                         if state_key in idle_tracking or state_key in idle_alerted:
                             print(f"  RALENTI RESET {dname}: posicion vieja ({last_update})")
@@ -2042,9 +2359,9 @@ def main():
                         idle_tracking.pop(state_key, None)
                         idle_alerted.pop(state_key, None)
 
-                    # -------------------------------------------------------
+                    # ---------------------------------------------------
                     # VELOCIDAD
-                    # -------------------------------------------------------
+                    # ---------------------------------------------------
                     if pos_stale:
                         speed_exceed_tracking.pop(state_key, None)
                         continue
@@ -2107,7 +2424,6 @@ def main():
                         "limit": limit,
                         "zone": zone,
                     })
-                    # FIX: guardar daily_events en estado despues de cada alerta
                     save_daily_events_to_state(state)
                     save_runtime_state(state)
                     print(f"  Alerta enviada ({mensajes.get('severity', '?')})")
