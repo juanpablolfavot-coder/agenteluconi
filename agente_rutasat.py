@@ -5,9 +5,12 @@ import csv
 import json
 import os
 import re
+import threading
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
+import logging
 
 import anthropic
 import requests
@@ -75,6 +78,29 @@ LOG_FIELDNAMES = [
     "zone",
 ]
 
+# ---------------------------------------------------------------------------
+# FIX 3: Rotación del CSV de logs — máx 5 MB, 3 backups
+# ---------------------------------------------------------------------------
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024)))  # 5 MB
+LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "3"))
+
+def _rotate_csv_if_needed(path=LOG_PATH):
+    """Rota el CSV si supera LOG_MAX_BYTES, guardando hasta LOG_BACKUP_COUNT backups."""
+    try:
+        if not os.path.exists(path):
+            return
+        if os.path.getsize(path) < LOG_MAX_BYTES:
+            return
+        for i in range(LOG_BACKUP_COUNT - 1, 0, -1):
+            src = f"{path}.{i}"
+            dst = f"{path}.{i + 1}"
+            if os.path.exists(src):
+                os.replace(src, dst)
+        os.replace(path, f"{path}.1")
+        print(f"  CSV rotado: {path} → {path}.1")
+    except Exception as e:
+        print(f"  Error rotando CSV: {e}")
+
 URBAN_BBOXES = {
     "RIO_TERCERO": (-32.20, -64.14, -32.12, -64.05),
     "CORDOBA": (-31.47, -64.26, -31.33, -64.10),
@@ -107,6 +133,8 @@ NEXPRO_PASSWORD = os.getenv("NEXPRO_PASSWORD", "")
 NEXPRO_PERFIL = os.getenv("NEXPRO_PERFIL", "139")
 NEXPRO_IDIOMA = os.getenv("NEXPRO_IDIOMA", "1")
 
+# FIX 2: Lock para proteger la sesión NexproConnect contra condiciones de carrera
+_nexpro_lock = threading.Lock()
 _nexpro_session = None
 _nexpro_seg_body: str = ""
 
@@ -299,8 +327,10 @@ wa_session_active = {}
 
 geocode_cache = {}
 
+# FIX 2: Token RutaSat protegido con lock para acceso thread-safe
 _rutasat_token = None
 _rutasat_token_expiry = 0
+_rutasat_token_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -631,14 +661,19 @@ def split_whatsapp_text(text, limit=MAX_WA_BODY):
 
 
 # ---------------------------------------------------------------------------
-# GEOCODIFICACION INVERSA (Nominatim — gratis, sin API key)
+# FIX 5: GEOCODIFICACION INVERSA con rate limiting real (1 req/seg)
 # ---------------------------------------------------------------------------
 GEOCODE_CACHE_TTL = 86400
 GEOCODE_PRECISION = 3
 GEOCODE_TIMEOUT = 5
+_geocode_lock = threading.Lock()
+_geocode_last_request = 0.0   # timestamp de la última llamada a Nominatim
+GEOCODE_MIN_INTERVAL = 1.1    # segundos mínimos entre requests (ToS: 1 req/seg)
 
 
 def reverse_geocode(lat, lng):
+    global _geocode_last_request
+
     lat_r = round(float(lat), GEOCODE_PRECISION)
     lng_r = round(float(lng), GEOCODE_PRECISION)
     cache_key = f"{lat_r},{lng_r}"
@@ -647,6 +682,13 @@ def reverse_geocode(lat, lng):
     cached = geocode_cache.get(cache_key)
     if cached and (ahora - cached["ts"]) < GEOCODE_CACHE_TTL:
         return cached["data"]
+
+    # Rate limiting: esperar si la última request fue hace menos de 1.1 seg
+    with _geocode_lock:
+        elapsed = time.time() - _geocode_last_request
+        if elapsed < GEOCODE_MIN_INTERVAL:
+            time.sleep(GEOCODE_MIN_INTERVAL - elapsed)
+        _geocode_last_request = time.time()
 
     try:
         url = "https://nominatim.openstreetmap.org/reverse"
@@ -657,7 +699,7 @@ def reverse_geocode(lat, lng):
             "zoom": 16,
             "addressdetails": 1,
         }
-        headers = {"User-Agent": "RutaSat-Monitor/1.0"}
+        headers = {"User-Agent": "RutaSat-Monitor/2.1 (flota privada Argentina)"}
         r = requests.get(url, params=params, headers=headers, timeout=GEOCODE_TIMEOUT)
         r.raise_for_status()
         data = r.json()
@@ -680,12 +722,12 @@ def reverse_geocode(lat, lng):
 
         result = ", ".join(parts) if parts else data.get("display_name", "")[:60]
 
-        geocode_cache[cache_key] = {"ts": ahora, "data": result}
+        geocode_cache[cache_key] = {"ts": time.time(), "data": result}
         return result
 
     except Exception as e:
         print(f"  Geocode error: {e}")
-        geocode_cache[cache_key] = {"ts": ahora, "data": None}
+        geocode_cache[cache_key] = {"ts": time.time(), "data": None}
         return None
 
 
@@ -700,34 +742,55 @@ def format_location(lat, lng):
 # RUTASAT API
 # ---------------------------------------------------------------------------
 def get_rutasat_token():
+    """
+    FIX 2: Token protegido con lock.
+    FIX 2: Token persistido en STATE_FILE para sobrevivir reinicios.
+    """
     global _rutasat_token, _rutasat_token_expiry
 
     ahora = time.time()
-    if _rutasat_token and ahora < _rutasat_token_expiry:
+
+    with _rutasat_token_lock:
+        if _rutasat_token and ahora < _rutasat_token_expiry:
+            return _rutasat_token
+
+        # Intentar recuperar token del estado persistente
+        state = load_runtime_state()
+        saved_token = state.get("rutasat_token")
+        saved_expiry = state.get("rutasat_token_expiry", 0)
+        if saved_token and ahora < saved_expiry:
+            _rutasat_token = saved_token
+            _rutasat_token_expiry = saved_expiry
+            print("  RutaSat token recuperado del estado persistente")
+            return _rutasat_token
+
+        session = requests.Session()
+
+        r1 = session.post(
+            f"{RUTASAT_BASE_URL}/session",
+            data={"email": RUTASAT_EMAIL, "password": RUTASAT_PASSWORD},
+            timeout=15,
+        )
+        r1.raise_for_status()
+
+        expiration = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r2 = session.post(
+            f"{RUTASAT_BASE_URL}/session/token",
+            data={"expiration": expiration},
+            timeout=15,
+        )
+        r2.raise_for_status()
+
+        _rutasat_token = r2.text.strip()
+        _rutasat_token_expiry = ahora + (29 * 86400)
+
+        # Persistir token para sobrevivir reinicios
+        state["rutasat_token"] = _rutasat_token
+        state["rutasat_token_expiry"] = _rutasat_token_expiry
+        save_runtime_state(state)
+
+        print("  RutaSat token OK (expira en 30 dias)")
         return _rutasat_token
-
-    session = requests.Session()
-
-    r1 = session.post(
-        f"{RUTASAT_BASE_URL}/session",
-        data={"email": RUTASAT_EMAIL, "password": RUTASAT_PASSWORD},
-        timeout=15,
-    )
-    r1.raise_for_status()
-
-    expiration = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    r2 = session.post(
-        f"{RUTASAT_BASE_URL}/session/token",
-        data={"expiration": expiration},
-        timeout=15,
-    )
-    r2.raise_for_status()
-
-    _rutasat_token = r2.text.strip()
-    _rutasat_token_expiry = ahora + (29 * 86400)
-
-    print("  RutaSat token OK (expira en 30 dias)")
-    return _rutasat_token
 
 
 def rutasat_get(path, params=None):
@@ -922,10 +985,12 @@ def _nexpro_login():
 
 
 def _nexpro_get_session():
+    # FIX 2: protegido con lock para evitar login simultáneo desde threads
     global _nexpro_session
-    if _nexpro_session is None:
-        _nexpro_login()
-    return _nexpro_session
+    with _nexpro_lock:
+        if _nexpro_session is None:
+            _nexpro_login()
+        return _nexpro_session
 
 
 def _nexpro_parse_positions(raw: str) -> dict:
@@ -1002,8 +1067,9 @@ def _nexpro_get_positions() -> dict:
 
     except RuntimeError:
         global _nexpro_session
-        _nexpro_session = None
-        _nexpro_login()
+        with _nexpro_lock:
+            _nexpro_session = None
+            _nexpro_login()
         r2 = _nexpro_session.post(
             f"{NEXPRO_BASE_URL}/api/Seguimiento_Ajax/Post",
             data={"accion": "todos", "idPais": "-1", "idProvincia": "-1", "idEmpresa": "-1"},
@@ -1047,8 +1113,9 @@ def get_nexpro_vehicles() -> list:
             or "login" in r.url.lower()
             or (r.status_code == 200 and len(r.text) < 10)
         ):
-            _nexpro_session = None
-            _nexpro_login()
+            with _nexpro_lock:
+                _nexpro_session = None
+                _nexpro_login()
             return get_nexpro_vehicles()
 
         r.raise_for_status()
@@ -1183,9 +1250,11 @@ def send_to_admins(client, body):
 
 
 # ---------------------------------------------------------------------------
-# LOG CSV
+# LOG CSV — FIX 3: con rotación automática
 # ---------------------------------------------------------------------------
 def log_event(row, path=LOG_PATH):
+    _rotate_csv_if_needed(path)
+
     exists = os.path.exists(path)
     payload = {key: row.get(key, "") for key in LOG_FIELDNAMES}
 
@@ -1755,7 +1824,7 @@ def generar_reporte_movimientos_nocturno(vehicles):
 
 
 # ---------------------------------------------------------------------------
-# CIERRE OPERATIVO 18HS
+# CIERRE OPERATIVO 18HS — FIX 4: doble protección contra duplicados
 # ---------------------------------------------------------------------------
 def generar_reporte_cierre_18(devices, fecha=None):
     fecha = fecha or now_local().date()
@@ -2155,6 +2224,8 @@ def main():
 
     state = load_runtime_state()
     last_summary_date = state_get_date(state, "last_summary_date")
+
+    # FIX 4: Cierre 18hs — verificar también en estado persistente al arrancar
     last_cierre_18_date = state_get_date(state, "last_cierre_18_date")
 
     global daily_events
@@ -2162,7 +2233,7 @@ def main():
     if daily_events:
         print(f"  Estado restaurado: {len(daily_events)} eventos del dia cargados")
 
-    print("\nAgente RutaSat v2.1 + NexproConnect corriendo")
+    print("\nAgente RutaSat v2.2 + NexproConnect corriendo")
     print(f"  Poll: {POLL_SECONDS}s | Ruta: {LIMITE_RUTA}km/h | Urbano: {LIMITE_URBANO}km/h | Ruta-110: 110km/h")
     if PATENTES_110:
         print(f"  Vehiculos 110km/h - Patentes: {', '.join(sorted(PATENTES_110))}")
@@ -2182,7 +2253,8 @@ def main():
     print(f"  Exceso de velocidad sostenido: {SPEED_EXCEED_MINUTES} min")
     print(f"  Clima cache TTL: {WEATHER_CACHE_TTL}s | backoff 429: {WEATHER_BACKOFF_SECONDS}s")
     print(f"  Posicion vieja: {STALE_POSITION_MINUTES} min")
-    print(f"  Geocodificacion inversa: Nominatim (gratis)")
+    print(f"  Geocodificacion inversa: Nominatim (gratis, rate limit 1 req/seg)")
+    print(f"  CSV rotacion: cada {LOG_MAX_BYTES // 1024 // 1024} MB, {LOG_BACKUP_COUNT} backups")
     print(f"  NexproConnect (Ivecos): {'Configurado ✓' if NEXPRO_EMAIL else 'No configurado (agregar NEXPRO_EMAIL/PASSWORD en .envvars)'}")
     print()
 
@@ -2260,6 +2332,8 @@ def main():
                 time.sleep(30)
                 continue
 
+            # FIX 4: Cierre 18hs — se guarda en estado persistente inmediatamente
+            # para que un reinicio posterior no lo vuelva a enviar
             if hora_local.hour >= 18 and last_cierre_18_date != today:
                 print("  Generando cierre operativo 18hs...")
                 try:
@@ -2267,7 +2341,7 @@ def main():
                     send_to_admins(twilio, cierre_18)
                     last_cierre_18_date = today
                     state_set_date(state, "last_cierre_18_date", today)
-                    save_runtime_state(state)
+                    save_runtime_state(state)  # guardado inmediato post-cierre
                     print("  Cierre 18hs enviado")
                 except Exception as e:
                     print(f"  Error cierre 18hs: {e}")
@@ -2333,9 +2407,7 @@ def main():
                         except Exception:
                             pass
 
-                    # ---------------------------------------------------
                     # USO FUERA DE HORARIO
-                    # ---------------------------------------------------
                     if is_after_hours_excluded(v):
                         after_hours_motion_state.pop(state_key, None)
                     elif is_after_hours(hora_local):
@@ -2356,9 +2428,7 @@ def main():
                     else:
                         after_hours_motion_state.pop(state_key, None)
 
-                    # ---------------------------------------------------
                     # RALENTI
-                    # ---------------------------------------------------
                     if pos_stale:
                         if state_key in idle_tracking or state_key in idle_alerted:
                             print(f"  RALENTI RESET {dname}: posicion vieja ({last_update})")
@@ -2439,9 +2509,7 @@ def main():
                         idle_tracking.pop(state_key, None)
                         idle_alerted.pop(state_key, None)
 
-                    # ---------------------------------------------------
                     # VELOCIDAD
-                    # ---------------------------------------------------
                     if pos_stale:
                         speed_exceed_tracking.pop(state_key, None)
                         continue
@@ -2521,8 +2589,15 @@ def main():
 
 
 # ---------------------------------------------------------------------------
-# ENTRY POINT
+# ENTRY POINT — FIX 1: gunicorn como servidor WSGI en producción
 # ---------------------------------------------------------------------------
+# Para Render, en lugar de python agente_rutasat.py, usar:
+#   gunicorn agente_rutasat:gunicorn_app --workers 1 --threads 2 --bind 0.0.0.0:$PORT
+#
+# En el Procfile o Start Command de Render poner exactamente esa línea.
+# gunicorn se instala con: pip install gunicorn
+# El script igual puede correrse directamente con python para desarrollo local.
+
 if __name__ == "__main__":
     import threading
 
@@ -2545,3 +2620,34 @@ if __name__ == "__main__":
         app.run(host="0.0.0.0", port=port, debug=False, threaded=True, use_reloader=False)
     else:
         main()
+
+
+# ---------------------------------------------------------------------------
+# FIX 1: Objeto app para gunicorn
+# Gunicorn importa este módulo y busca la variable `gunicorn_app`.
+# El loop principal corre en un thread daemon al importar.
+# ---------------------------------------------------------------------------
+def _start_background_agent():
+    """Inicia el agente en background cuando gunicorn importa el módulo."""
+    import threading
+
+    def watchdog():
+        while True:
+            t = threading.Thread(target=main, daemon=True)
+            t.start()
+            print("Agente iniciado en background (gunicorn)")
+            t.join()
+            print("WATCHDOG: reiniciando en 10s...")
+            time.sleep(10)
+
+    wt = threading.Thread(target=watchdog, daemon=True)
+    wt.start()
+
+
+# Solo iniciar el agente si corremos bajo gunicorn (no bajo __main__)
+if os.getenv("SERVER_SOFTWARE", "").startswith("gunicorn") or (
+    __name__ != "__main__" and not os.getenv("NO_BACKGROUND_AGENT")
+):
+    _start_background_agent()
+
+gunicorn_app = create_webhook_app()
