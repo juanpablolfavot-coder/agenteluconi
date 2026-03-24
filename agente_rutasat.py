@@ -1033,11 +1033,6 @@ def _nexpro_parse_positions(raw: str) -> dict:
         if not plate or not is_valid_plate(plate):
             continue
 
-        # DEBUG temporal — borrar después
-        print(f"  [NX DEBUG] plate={plate!r} fecha={fecha!r} parts_count={len(parts)}")
-        if len(parts) > 12:
-            print(f"  [NX DEBUG] parts: {parts[:13]}")
-
         positions[plate] = {
             "lat": lat,
             "lng": lng,
@@ -1177,6 +1172,7 @@ def get_nexpro_vehicles() -> list:
             "ignition": ignition,
             "last_update": fecha,
             "_source": "nexpro",
+            "_estado_raw": estado,
         })
 
     print(f"  [NexproConnect] {len(vehicles)} vehículos OK")
@@ -2007,7 +2003,17 @@ def create_webhook_app():
 
                 if found:
                     stale = is_stale(found, STALE_POSITION_MINUTES)
-                    estado_nexpro = vehicle.get("_source") == "nexpro" and "sleep" in str(found.get("_estado_raw", "")).lower() if stale:     stale_tag = " 🌙 modo sleep" if estado_nexpro else " ⚠️ sin actualización reciente" else:     stale_tag = ""
+                    if stale:
+                        es_sleep = "sleep" in str(found.get("_estado_raw", "")).lower()
+                        es_sin_senal = "sin señal" in str(found.get("_estado_raw", "")).lower()
+                        if es_sleep:
+                            stale_tag = " 🌙 motor apagado (sleep)"
+                        elif es_sin_senal:
+                            stale_tag = " 📵 sin señal GPS"
+                        else:
+                            stale_tag = " ⚠️ sin actualización reciente"
+                    else:
+                        stale_tag = ""
                     fuente_tag = " [NexproConnect]" if found.get("_source") == "nexpro" else " [RutaSat]"
                     loc = format_location(found["lat"], found["lng"])
                     respuesta = (
