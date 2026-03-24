@@ -101,11 +101,11 @@ AFTER_HOURS_EXCLUIDOS_MATCH: set = {
 # ---------------------------------------------------------------------------
 # CONFIG NEXPRO CONNECT (segundo satelital — Ivecos)
 # ---------------------------------------------------------------------------
-NEXPRO_BASE_URL  = os.getenv("NEXPRO_BASE_URL", "https://nexproconnect.net/iveco")
-NEXPRO_EMAIL     = os.getenv("NEXPRO_EMAIL", "")
-NEXPRO_PASSWORD  = os.getenv("NEXPRO_PASSWORD", "")
-NEXPRO_PERFIL    = os.getenv("NEXPRO_PERFIL", "139")   # hdPerfilUsuario
-NEXPRO_IDIOMA    = os.getenv("NEXPRO_IDIOMA", "1")
+NEXPRO_BASE_URL = os.getenv("NEXPRO_BASE_URL", "https://nexproconnect.net/iveco")
+NEXPRO_EMAIL = os.getenv("NEXPRO_EMAIL", "")
+NEXPRO_PASSWORD = os.getenv("NEXPRO_PASSWORD", "")
+NEXPRO_PERFIL = os.getenv("NEXPRO_PERFIL", "139")   # hdPerfilUsuario
+NEXPRO_IDIOMA = os.getenv("NEXPRO_IDIOMA", "1")
 
 # Sesión persistente NexproConnect
 _nexpro_session = None
@@ -170,7 +170,11 @@ def extract_plate_from_name(text):
 # Patentes con límite 110 km/h — configurable via .envvars
 _patentes_110_env = os.getenv("PATENTES_110", "")
 if _patentes_110_env.strip():
-    PATENTES_110: set = set(x.strip().upper().replace(" ", "") for x in _patentes_110_env.split(",") if x.strip())
+    PATENTES_110: set = set(
+        x.strip().upper().replace(" ", "")
+        for x in _patentes_110_env.split(",")
+        if x.strip()
+    )
 else:
     PATENTES_110: set = {
         "JFV681", "JFV680", "ORF347", "ORF342", "KCB412",
@@ -245,7 +249,10 @@ def display_name(plate, raw_name=None):
 
 
 def get_admin_numbers():
-    return [x for x in [ADMIN_WHATSAPP, ADMIN2_WHATSAPP, ADMIN3_WHATSAPP, ADMIN4_WHATSAPP] if x]
+    return [
+        x for x in [ADMIN_WHATSAPP, ADMIN2_WHATSAPP, ADMIN3_WHATSAPP, ADMIN4_WHATSAPP]
+        if x
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -418,30 +425,46 @@ def is_position_stale(last_update, max_age_minutes=STALE_POSITION_MINUTES):
 def is_position_stale_nexpro(last_update_str, max_age_minutes=STALE_POSITION_MINUTES):
     """
     Versión de is_position_stale para fechas NexproConnect con formato
-    'dd/MM/yyyy HH:mm:ss' o 'dd/M/yyyy HH:mm:ss'.
+    'dd/MM/yyyy HH:mm:ss'.
     """
     if not last_update_str:
         return True
-    try:
-        # Limpiar caracteres basura que puede traer el HTML
-        clean = re.sub(r"[<'>]", "", last_update_str).strip()
-        dt = datetime.strptime(clean, "%d/%m/%Y %H:%M:%S")
-        dt = dt.replace(tzinfo=timezone(timedelta(hours=-3)))
-        age = now_local() - dt
-        return age.total_seconds() > (max_age_minutes * 60)
-    except Exception:
-        # Intentar con formato corto de mes
+
+    clean = re.sub(r"[<'>]", "", str(last_update_str)).strip()
+
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%y %H:%M:%S"):
         try:
-            clean = re.sub(r"[<'>]", "", last_update_str).strip()
-            dt = datetime.strptime(clean, "%d/%m/%Y %H:%M:%S")
+            dt = datetime.strptime(clean, fmt)
             dt = dt.replace(tzinfo=timezone(timedelta(hours=-3)))
             age = now_local() - dt
             return age.total_seconds() > (max_age_minutes * 60)
         except Exception:
-            return True
+            pass
+
+    return True
 
 
-def is_stale(v, m=STALE_POSITION_MINUTES):    u=v.get("last_update","")
+def is_stale(vehicle, max_age_minutes=STALE_POSITION_MINUTES):
+    """
+    Determina si la última posición del vehículo es vieja.
+    Usa parser normal para RutaSat y parser especial para NexproConnect.
+    """
+    last_update = vehicle.get("last_update", "")
+
+    if vehicle.get("_source") == "nexpro":
+        return is_position_stale_nexpro(last_update, max_age_minutes)
+
+    return is_position_stale(last_update, max_age_minutes)
+
+
+def vehicle_state_key(vehicle):
+    """
+    Clave estable para guardar estado por vehículo.
+    Prioridad:
+    1) device_id
+    2) plate
+    3) name normalizado
+    """
     device_id = vehicle.get("device_id")
     if device_id is not None and str(device_id).strip():
         return str(device_id).strip()
@@ -785,9 +808,9 @@ def _nexpro_login():
     html = r.text
     print(f"  [NexproConnect] GET login url={r.url} status={r.status_code} html_len={len(html)}")
 
-    vs  = _extract_field("__VIEWSTATE", html)
+    vs = _extract_field("__VIEWSTATE", html)
     vsg = _extract_field("__VIEWSTATEGENERATOR", html)
-    ev  = _extract_field("__EVENTVALIDATION", html)
+    ev = _extract_field("__EVENTVALIDATION", html)
     print(f"  [NexproConnect] VS_len={len(vs)} VSG={vsg} EV_len={len(ev)}")
 
     # Si el GET nos redirigió (ya hay sesión activa del lado del server)
@@ -796,16 +819,16 @@ def _nexpro_login():
 
     # Nombres reales de los campos (inspeccionados del HTML real del form)
     login_payload = {
-        "ctl00$hdIdioma":       "1",
-        "ctl00$hdUrl":          "-1",
-        "__EVENTTARGET":        "",
-        "__EVENTARGUMENT":      "",
-        "__VIEWSTATE":          vs,
+        "ctl00$hdIdioma": "1",
+        "ctl00$hdUrl": "-1",
+        "__EVENTTARGET": "",
+        "__EVENTARGUMENT": "",
+        "__VIEWSTATE": vs,
         "__VIEWSTATEGENERATOR": vsg,
-        "__EVENTVALIDATION":    ev,
-        "ctl00$contenidoMaster$txtMail":  NEXPRO_EMAIL,
+        "__EVENTVALIDATION": ev,
+        "ctl00$contenidoMaster$txtMail": NEXPRO_EMAIL,
         "ctl00$contenidoMaster$txtClave": NEXPRO_PASSWORD,
-        "ctl00$contenidoMaster$btnIr":    "Iniciar Sesión",
+        "ctl00$contenidoMaster$btnIr": "Iniciar Sesión",
     }
 
     # 2) POST de login
@@ -820,7 +843,6 @@ def _nexpro_login():
 
     # Si sigue en login2 = credenciales incorrectas o ViewState vacío
     if "login2" in r2.url.lower():
-        # Mostrar qué tiene el HTML de respuesta (primeros 500 chars sin sensibles)
         preview = r2.text[:300].replace(NEXPRO_PASSWORD, "***")
         print(f"  [NexproConnect] Login falló, respuesta preview: {preview}")
         raise RuntimeError("NexproConnect: login fallido — verificá usuario/contraseña")
@@ -882,7 +904,6 @@ def _nexpro_parse_positions(raw: str) -> dict:
         if not entry:
             continue
 
-        # Tomar primera línea (datos separados por ';')
         first_line = entry.split("\n")[0].strip()
         parts = first_line.split(";")
 
@@ -890,25 +911,25 @@ def _nexpro_parse_positions(raw: str) -> dict:
             continue
 
         try:
-            lat   = float(parts[0])
-            lng   = float(parts[1])
+            lat = float(parts[0])
+            lng = float(parts[1])
             speed = float(parts[2]) if parts[2] else 0.0
         except ValueError:
             continue
 
-        fecha     = parts[4].strip() if len(parts) > 4 else ""
-        estado    = parts[7].strip() if len(parts) > 7 else ""
-        dominio   = parts[8].strip() if len(parts) > 8 else ""
+        fecha = parts[4].strip() if len(parts) > 4 else ""
+        estado = parts[7].strip() if len(parts) > 7 else ""
+        dominio = parts[8].strip() if len(parts) > 8 else ""
         device_id = parts[11].strip() if len(parts) > 11 else ""
 
         if dominio:
             plate = normalize_plate(dominio)
             positions[plate] = {
-                "lat":       lat,
-                "lng":       lng,
+                "lat": lat,
+                "lng": lng,
                 "speed_kmh": speed,
-                "estado":    estado,
-                "fecha":     fecha,
+                "estado": estado,
+                "fecha": fecha,
                 "device_id": device_id,
             }
 
@@ -922,10 +943,10 @@ def _nexpro_get_positions() -> dict:
         r = s.post(
             f"{NEXPRO_BASE_URL}/api/Seguimiento_Ajax/Post",
             data={
-                "accion":      "todos",
-                "idPais":      "-1",
+                "accion": "todos",
+                "idPais": "-1",
                 "idProvincia": "-1",
-                "idEmpresa":   "-1",
+                "idEmpresa": "-1",
             },
             headers={"X-Requested-With": "XMLHttpRequest"},
             timeout=20,
@@ -936,7 +957,6 @@ def _nexpro_get_positions() -> dict:
         return _nexpro_parse_positions(r.text)
 
     except RuntimeError:
-        # Re-login automático
         global _nexpro_session
         _nexpro_session = None
         _nexpro_login()
@@ -979,7 +999,6 @@ def get_nexpro_vehicles() -> list:
             timeout=25,
         )
 
-        # Detectar sesión expirada
         if (r.status_code in (302, 401, 403) or
                 "login" in r.url.lower() or
                 (r.status_code == 200 and len(r.text) < 10)):
@@ -1005,13 +1024,12 @@ def get_nexpro_vehicles() -> list:
     # 3) Construir lista
     vehicles = []
     for row in rows:
-        # col[0]: botones HTML — el device_id está en el onclick de historico2
-        html_col0  = row[0] if len(row) > 0 else ""
-        m_uid      = re.search(r"historico2\((\d+),", html_col0)
+        html_col0 = row[0] if len(row) > 0 else ""
+        m_uid = re.search(r"historico2\((\d+),", html_col0)
         device_num = m_uid.group(1) if m_uid else ""
 
-        plate_raw   = str(row[1]).strip() if len(row) > 1 else ""
-        model       = str(row[2]).strip() if len(row) > 2 else ""
+        plate_raw = str(row[1]).strip() if len(row) > 1 else ""
+        model = str(row[2]).strip() if len(row) > 2 else ""
         last_update = re.sub(r"[<'>]", "", str(row[3])).strip() if len(row) > 3 else ""
         estado_grid = str(row[4]).strip() if len(row) > 4 else ""
 
@@ -1020,29 +1038,27 @@ def get_nexpro_vehicles() -> list:
 
         plate = normalize_plate(plate_raw)
 
-        # Posición GPS del endpoint Post
-        pos       = positions.get(plate, {})
-        lat       = pos.get("lat", 0.0)
-        lng       = pos.get("lng", 0.0)
+        pos = positions.get(plate, {})
+        lat = pos.get("lat", 0.0)
+        lng = pos.get("lng", 0.0)
         speed_kmh = pos.get("speed_kmh", 0.0)
-        estado    = pos.get("estado", estado_grid)
-        fecha     = pos.get("fecha", last_update)
+        estado = pos.get("estado", estado_grid)
+        fecha = pos.get("fecha", last_update)
 
-        # Ignición: True si no está Parado ni en modo sleep
         ignition = estado.lower() not in (
             "parado", "reporte modo sleep", "sin señal", ""
         )
 
         vehicles.append({
-            "plate":       plate,
-            "device_id":   f"nexpro_{device_num or plate}",
-            "name":        f"{plate} ({model})" if model else plate,
-            "lat":         lat,
-            "lng":         lng,
-            "speed_kmh":   speed_kmh,
-            "ignition":    ignition,
+            "plate": plate,
+            "device_id": f"nexpro_{device_num or plate}",
+            "name": f"{plate} ({model})" if model else plate,
+            "lat": lat,
+            "lng": lng,
+            "speed_kmh": speed_kmh,
+            "ignition": ignition,
             "last_update": fecha,
-            "_source":     "nexpro",
+            "_source": "nexpro",
         })
 
     print(f"  [NexproConnect] {len(vehicles)} vehículos OK")
@@ -1149,7 +1165,7 @@ def log_event(row, path=LOG_PATH):
                     minutes=float(row.get("minutes", 0) or 0),
                     severity=str(row.get("severity", "media")),
                 )
-        except Exception as _e:
+        except Exception:
             pass
 
 
@@ -1812,7 +1828,6 @@ def create_webhook_app():
                 devices = get_devices()
                 positions = get_positions()
                 vehicles = build_vehicle_list(devices, positions)
-                # Agregar Ivecos NexproConnect
                 try:
                     nexpro_v = get_nexpro_vehicles()
                     vehicles = vehicles + nexpro_v
@@ -2182,7 +2197,6 @@ def main():
                 positions = get_positions()
                 vehicles = build_vehicle_list(devices, positions)
 
-                # Agregar Ivecos de NexproConnect
                 try:
                     nexpro_v = get_nexpro_vehicles()
                     vehicles = vehicles + nexpro_v
@@ -2193,7 +2207,7 @@ def main():
                 cleanup_missing_vehicle_states(active_state_keys)
 
                 rutasat_count = len([v for v in vehicles if v.get("_source") != "nexpro"])
-                nexpro_count  = len([v for v in vehicles if v.get("_source") == "nexpro"])
+                nexpro_count = len([v for v in vehicles if v.get("_source") == "nexpro"])
                 print(f"  Vehiculos: {len(vehicles)} (RutaSat={rutasat_count} | NexproConnect={nexpro_count})", flush=True)
 
             except Exception as e:
@@ -2271,7 +2285,7 @@ def main():
                                     if anomalies and ahora_ts - last_alert_ts.get(f"anom_{state_key}", 0) > 3600:
                                         last_alert_ts[f"anom_{state_key}"] = ahora_ts
                                         send_to_admins(twilio, f"🚨 Anomalía GPS: {dname}\n  · {anom}")
-                        except Exception as _ae:
+                        except Exception:
                             pass
 
                     # ---------------------------------------------------
