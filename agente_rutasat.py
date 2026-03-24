@@ -480,6 +480,29 @@ def is_stale(vehicle, max_age_minutes=STALE_POSITION_MINUTES):
     return is_position_stale(last_update, max_age_minutes)
 
 
+def format_last_update(vehicle):
+    raw = str(vehicle.get("last_update", "") or "").strip()
+
+    if not raw:
+        return "--:--"
+
+    if vehicle.get("_source") == "nexpro":
+        clean = strip_html(raw)
+        for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%y %H:%M:%S"):
+            try:
+                dt = datetime.strptime(clean, fmt)
+                return dt.strftime("%d/%m/%Y %H:%M:%S")
+            except Exception:
+                pass
+        return clean
+
+    dt = parse_dt_local(raw)
+    if dt:
+        return dt.strftime("%d/%m/%Y %H:%M:%S")
+
+    return raw
+
+
 def vehicle_state_key(vehicle):
     """
     Clave estable para guardar estado por vehículo.
@@ -1910,14 +1933,14 @@ def create_webhook_app():
 
                 if found:
                     stale = is_stale(found, STALE_POSITION_MINUTES)
-                    stale_tag = " ⚠️ GPS sin señal reciente" if stale else ""
+                    stale_tag = " ⚠️ sin actualización reciente" if stale else ""
                     fuente_tag = " [NexproConnect]" if found.get("_source") == "nexpro" else " [RutaSat]"
                     loc = format_location(found["lat"], found["lng"])
                     respuesta = (
                         f"📍 {display_name(found['plate'], found.get('name'))}{fuente_tag}\n"
                         f"  · Ubic.: {loc}\n"
                         f"  · Vel.: {found['speed_kmh']:.0f} km/h\n"
-                        f"  · Última pos.: {found.get('last_update', '--:--')}{stale_tag}\n"
+                        f"  · Última pos.: {format_last_update(found)}{stale_tag}\n"
                         f"  · Maps: https://maps.google.com/?q={found['lat']:.5f},{found['lng']:.5f}"
                     )
                 else:
