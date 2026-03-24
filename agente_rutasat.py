@@ -483,7 +483,7 @@ def is_position_stale_nexpro(last_update_str, max_age_minutes=STALE_POSITION_MIN
     if not last_update_str:
         return True
 
-    clean = strip_html(last_update_str)
+    clean = strip_html(last_update_str) # Normalizar hora sin cero: "1:01:00" → "01:01:00" import re as _re clean = _re.sub(r' (\d):', r' 0\1:', clean)
 
     for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%y %H:%M:%S"):
         try:
