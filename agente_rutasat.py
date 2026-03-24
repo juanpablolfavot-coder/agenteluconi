@@ -107,11 +107,9 @@ NEXPRO_PASSWORD = os.getenv("NEXPRO_PASSWORD", "")
 NEXPRO_PERFIL = os.getenv("NEXPRO_PERFIL", "139")
 NEXPRO_IDIOMA = os.getenv("NEXPRO_IDIOMA", "1")
 
-# Sesión persistente NexproConnect
 _nexpro_session = None
 _nexpro_seg_body: str = ""
 
-# Columnas exactas que espera el endpoint Seg/ (capturadas del request real del browser)
 _NEXPRO_COLS = (
     '[{"UsaHTML":false,"DataField":"","Name":"Acciones","HeaderText":"Acciones",'
     '"Type":4,"Exportar":false,"Translate":false,"ActionFormat":""},'
@@ -140,15 +138,26 @@ def normalize_plate(text):
 def is_valid_plate(text):
     t = normalize_plate(text)
     patterns = (
-        r"^[A-Z]{3}\d{3}$",          # ABC123
-        r"^[A-Z]{2}\d{3}[A-Z]{2}$",  # AB123CD
-        r"^[A-Z]\d{3}[A-Z]{3}$",     # A123BCD
+        r"^[A-Z]{3}\d{3}$",
+        r"^[A-Z]{2}\d{3}[A-Z]{2}$",
+        r"^[A-Z]\d{3}[A-Z]{3}$",
     )
     return any(re.fullmatch(p, t) for p in patterns)
 
 
+def strip_html(text):
+    text = str(text or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;?", " ", text)
+    text = re.sub(r"&amp;", "&", text)
+    text = re.sub(r"&quot;", '"', text)
+    text = re.sub(r"&#39;", "'", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
 def extract_plate_from_name(text):
-    raw = (text or "").upper()
+    raw = strip_html(text).upper()
 
     patterns = [
         r"\b([A-Z]{2}\d{3}[A-Z]{2})\b",
@@ -444,7 +453,7 @@ def is_position_stale_nexpro(last_update_str, max_age_minutes=STALE_POSITION_MIN
     if not last_update_str:
         return True
 
-    clean = re.sub(r"[<'>]", "", str(last_update_str)).strip()
+    clean = strip_html(last_update_str)
 
     for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%y %H:%M:%S"):
         try:
@@ -927,10 +936,10 @@ def _nexpro_parse_positions(raw: str) -> dict:
         except ValueError:
             continue
 
-        fecha = parts[4].strip() if len(parts) > 4 else ""
-        estado = parts[7].strip() if len(parts) > 7 else ""
-        dominio = parts[8].strip() if len(parts) > 8 else ""
-        device_id = parts[11].strip() if len(parts) > 11 else ""
+        fecha = strip_html(parts[4]) if len(parts) > 4 else ""
+        estado = strip_html(parts[7]) if len(parts) > 7 else ""
+        dominio = strip_html(parts[8]) if len(parts) > 8 else ""
+        device_id = strip_html(parts[11]) if len(parts) > 11 else ""
 
         plate = normalize_plate(dominio)
         if not plate or not is_valid_plate(plate):
@@ -1035,17 +1044,21 @@ def get_nexpro_vehicles() -> list:
 
     vehicles = []
     for row in rows:
-        html_col0 = row[0] if len(row) > 0 else ""
+        html_col0 = str(row[0]) if len(row) > 0 else ""
         m_uid = re.search(r"historico2\((\d+),", html_col0)
         device_num = m_uid.group(1) if m_uid else ""
 
-        plate_raw = str(row[1]).strip() if len(row) > 1 else ""
-        model = str(row[2]).strip() if len(row) > 2 else ""
-        last_update = re.sub(r"[<'>]", "", str(row[3])).strip() if len(row) > 3 else ""
-        estado_grid = str(row[4]).strip() if len(row) > 4 else ""
+        plate_raw = strip_html(row[1]) if len(row) > 1 else ""
+        model = strip_html(row[2]) if len(row) > 2 else ""
+        last_update = strip_html(row[3]) if len(row) > 3 else ""
+        estado_grid = strip_html(row[4]) if len(row) > 4 else ""
 
-        plate = normalize_plate(plate_raw)
+        plate = extract_plate_from_name(plate_raw)
+        if not plate:
+            plate = normalize_plate(plate_raw)
+
         if not plate or not is_valid_plate(plate):
+            print(f"  [NexproConnect] Dominio descartado: raw={plate_raw!r}")
             continue
 
         pos = positions.get(plate, {})
@@ -2181,6 +2194,7 @@ def main():
                 except Exception as e:
                     print(f"  Error resumen: {e}")
 
+            # Reporte semanal — domingos a las 20hs
             if hora_local.weekday() == 6 and hora_local.hour == 20:
                 last_weekly = state.get("last_weekly_date", "")
                 if last_weekly != today.isoformat():
@@ -2199,6 +2213,7 @@ def main():
                     except Exception as e:
                         print(f"  Error reporte semanal: {e}")
 
+            # --- Obtener vehículos de ambas fuentes ---
             try:
                 devices = get_devices()
                 positions = get_positions()
@@ -2271,6 +2286,7 @@ def main():
                     if is_gps_temp_excluded(v):
                         continue
 
+                    # Analytics: registrar posición y detectar anomalías
                     if ANALYTICS_AVAILABLE and not pos_stale:
                         try:
                             an = get_analytics()
