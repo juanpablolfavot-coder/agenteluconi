@@ -32,7 +32,7 @@ ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 # TOMTOM_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # --- PARAMETROS DE MONITOREO ---
-POLL_SECONDS=120
+POLL_SECONDS=20
 LIMITE_RUTA=83
 LIMITE_URBANO=60
 IDLE_MINUTES=5
