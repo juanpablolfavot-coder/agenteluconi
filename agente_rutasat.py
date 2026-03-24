@@ -1033,6 +1033,11 @@ def _nexpro_parse_positions(raw: str) -> dict:
         if not plate or not is_valid_plate(plate):
             continue
 
+        # DEBUG temporal — borrar después
+        print(f"  [NX DEBUG] plate={plate!r} fecha={fecha!r} parts_count={len(parts)}")
+        if len(parts) > 12:
+            print(f"  [NX DEBUG] parts: {parts[:13]}")
+
         positions[plate] = {
             "lat": lat,
             "lng": lng,
