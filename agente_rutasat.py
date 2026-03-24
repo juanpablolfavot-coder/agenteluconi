@@ -1609,7 +1609,7 @@ def generar_reporte_horario(vehicles):
     for v in vehicles:
         if is_gps_temp_excluded(v):
             continue
-        if is_position_stale(v.get("last_update", ""), STALE_POSITION_MINUTES):
+        if is_stale(v, STALE_POSITION_MINUTES):
             continue
 
         spd = v["speed_kmh"]
@@ -1670,7 +1670,7 @@ def generar_reporte_movimientos_nocturno(vehicles):
             continue
         if is_gps_temp_excluded(v):
             continue
-        if is_position_stale(v.get("last_update", ""), STALE_POSITION_MINUTES):
+        if is_stale(v, STALE_POSITION_MINUTES):
             continue
 
         if v["speed_kmh"] > MOVEMENT_MIN_SPEED:
@@ -1872,7 +1872,7 @@ def create_webhook_app():
                         break
 
                 if found:
-                    stale = is_position_stale(found.get("last_update", ""), STALE_POSITION_MINUTES)
+                    stale = is_stale(found, STALE_POSITION_MINUTES)
                     stale_tag = " ⚠️ GPS sin señal reciente" if stale else ""
                     fuente_tag = " [NexproConnect]" if found.get("_source") == "nexpro" else " [RutaSat]"
                     loc = format_location(found["lat"], found["lng"])
@@ -2245,7 +2245,7 @@ def main():
                     ignition = v["ignition"]
                     last_update = v.get("last_update", "")
                     dname = display_name(plate, v.get("name"))
-                    pos_stale = is_position_stale(last_update, STALE_POSITION_MINUTES)
+                    pos_stale = is_stale(v, STALE_POSITION_MINUTES)
 
                     if is_gps_temp_excluded(v):
                         continue
