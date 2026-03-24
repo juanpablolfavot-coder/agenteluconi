@@ -441,7 +441,7 @@ def is_position_stale_nexpro(last_update_str, max_age_minutes=STALE_POSITION_MIN
             return True
 
 
-def vehicle_state_key(vehicle):
+def is_stale(v, m=STALE_POSITION_MINUTES):    u=v.get("last_update","")
     device_id = vehicle.get("device_id")
     if device_id is not None and str(device_id).strip():
         return str(device_id).strip()
