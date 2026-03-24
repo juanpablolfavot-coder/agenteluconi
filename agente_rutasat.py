@@ -104,7 +104,7 @@ AFTER_HOURS_EXCLUIDOS_MATCH: set = {
 NEXPRO_BASE_URL = os.getenv("NEXPRO_BASE_URL", "https://nexproconnect.net/iveco")
 NEXPRO_EMAIL = os.getenv("NEXPRO_EMAIL", "")
 NEXPRO_PASSWORD = os.getenv("NEXPRO_PASSWORD", "")
-NEXPRO_PERFIL = os.getenv("NEXPRO_PERFIL", "139")   # hdPerfilUsuario
+NEXPRO_PERFIL = os.getenv("NEXPRO_PERFIL", "139")
 NEXPRO_IDIOMA = os.getenv("NEXPRO_IDIOMA", "1")
 
 # Sesión persistente NexproConnect
@@ -137,6 +137,16 @@ def normalize_plate(text):
     return re.sub(r"[^A-Z0-9]", "", (text or "").upper())
 
 
+def is_valid_plate(text):
+    t = normalize_plate(text)
+    patterns = (
+        r"^[A-Z]{3}\d{3}$",          # ABC123
+        r"^[A-Z]{2}\d{3}[A-Z]{2}$",  # AB123CD
+        r"^[A-Z]\d{3}[A-Z]{3}$",     # A123BCD
+    )
+    return any(re.fullmatch(p, t) for p in patterns)
+
+
 def extract_plate_from_name(text):
     raw = (text or "").upper()
 
@@ -149,7 +159,9 @@ def extract_plate_from_name(text):
     for pat in patterns:
         m = re.search(pat, raw)
         if m:
-            return m.group(1)
+            cand = m.group(1)
+            if is_valid_plate(cand):
+                return cand
 
     compact = re.sub(r"[^A-Z0-9]", "", raw)
 
@@ -162,7 +174,9 @@ def extract_plate_from_name(text):
     for pat in compact_patterns:
         m = re.search(pat, compact)
         if m:
-            return m.group(1)
+            cand = m.group(1)
+            if is_valid_plate(cand):
+                return cand
 
     return ""
 
@@ -755,6 +769,9 @@ def build_vehicle_list(devices, positions):
         if not plate:
             plate = normalize_plate(name) or str(device_id)
 
+        if not is_valid_plate(plate):
+            continue
+
         if plate in DISPOSITIVOS_EXCLUIDOS:
             continue
 
@@ -781,7 +798,7 @@ def build_devices_lookup_by_plate(devices):
     for d in devices:
         name = (d.get("name") or "").strip()
         plate = extract_plate_from_name(name)
-        if plate:
+        if plate and is_valid_plate(plate):
             out[plate] = d
     return out
 
@@ -796,7 +813,6 @@ def _nexpro_login():
     s = requests.Session()
     s.headers.update({"User-Agent": "Mozilla/5.0 RutaSat-Monitor/2.0"})
 
-    # 1) GET login para obtener ViewState y campos ASP.NET
     r = s.get(f"{NEXPRO_BASE_URL}/Login/login2.aspx", timeout=20)
     r.raise_for_status()
 
@@ -813,11 +829,9 @@ def _nexpro_login():
     ev = _extract_field("__EVENTVALIDATION", html)
     print(f"  [NexproConnect] VS_len={len(vs)} VSG={vsg} EV_len={len(ev)}")
 
-    # Si el GET nos redirigió (ya hay sesión activa del lado del server)
     if "login2" not in r.url.lower():
         print(f"  [NexproConnect] GET redirigió a {r.url} — el server no acepta sesiones nuevas?")
 
-    # Nombres reales de los campos (inspeccionados del HTML real del form)
     login_payload = {
         "ctl00$hdIdioma": "1",
         "ctl00$hdUrl": "-1",
@@ -831,7 +845,6 @@ def _nexpro_login():
         "ctl00$contenidoMaster$btnIr": "Iniciar Sesión",
     }
 
-    # 2) POST de login
     r2 = s.post(
         f"{NEXPRO_BASE_URL}/Login/login2.aspx",
         data=login_payload,
@@ -841,13 +854,11 @@ def _nexpro_login():
     r2.raise_for_status()
     print(f"  [NexproConnect] POST login url={r2.url} status={r2.status_code}")
 
-    # Si sigue en login2 = credenciales incorrectas o ViewState vacío
     if "login2" in r2.url.lower():
         preview = r2.text[:300].replace(NEXPRO_PASSWORD, "***")
         print(f"  [NexproConnect] Login falló, respuesta preview: {preview}")
         raise RuntimeError("NexproConnect: login fallido — verificá usuario/contraseña")
 
-    # 3) Cargar página de seguimiento para obtener hdPerfilUsuario real
     r3 = s.get(f"{NEXPRO_BASE_URL}/MapServer/Seguimiento2.aspx", timeout=20)
     r3.raise_for_status()
 
@@ -855,7 +866,6 @@ def _nexpro_login():
     m_perfil = re.search(r'hdPerfilUsuario["\s]+value="(\d+)"', html3)
     perfil = m_perfil.group(1) if m_perfil else NEXPRO_PERFIL
 
-    # 4) Armar el body completo para el endpoint Seg/ (copiado del request real)
     _nexpro_seg_body = (
         f"cols={requests.utils.quote(_NEXPRO_COLS)}"
         f"&tg="
@@ -922,16 +932,18 @@ def _nexpro_parse_positions(raw: str) -> dict:
         dominio = parts[8].strip() if len(parts) > 8 else ""
         device_id = parts[11].strip() if len(parts) > 11 else ""
 
-        if dominio:
-            plate = normalize_plate(dominio)
-            positions[plate] = {
-                "lat": lat,
-                "lng": lng,
-                "speed_kmh": speed,
-                "estado": estado,
-                "fecha": fecha,
-                "device_id": device_id,
-            }
+        plate = normalize_plate(dominio)
+        if not plate or not is_valid_plate(plate):
+            continue
+
+        positions[plate] = {
+            "lat": lat,
+            "lng": lng,
+            "speed_kmh": speed,
+            "estado": estado,
+            "fecha": fecha,
+            "device_id": device_id,
+        }
 
     return positions
 
@@ -987,7 +999,6 @@ def get_nexpro_vehicles() -> list:
 
     s = _nexpro_get_session()
 
-    # 1) Lista de vehículos desde el grid
     try:
         r = s.post(
             f"{NEXPRO_BASE_URL}/api/Seguimiento_Ajax/Seg/",
@@ -999,9 +1010,11 @@ def get_nexpro_vehicles() -> list:
             timeout=25,
         )
 
-        if (r.status_code in (302, 401, 403) or
-                "login" in r.url.lower() or
-                (r.status_code == 200 and len(r.text) < 10)):
+        if (
+            r.status_code in (302, 401, 403)
+            or "login" in r.url.lower()
+            or (r.status_code == 200 and len(r.text) < 10)
+        ):
             _nexpro_session = None
             _nexpro_login()
             return get_nexpro_vehicles()
@@ -1018,10 +1031,8 @@ def get_nexpro_vehicles() -> list:
         print("  [NexproConnect] Sin vehículos en aaData")
         return []
 
-    # 2) Posiciones GPS en tiempo real
     positions = _nexpro_get_positions()
 
-    # 3) Construir lista
     vehicles = []
     for row in rows:
         html_col0 = row[0] if len(row) > 0 else ""
@@ -1033,10 +1044,9 @@ def get_nexpro_vehicles() -> list:
         last_update = re.sub(r"[<'>]", "", str(row[3])).strip() if len(row) > 3 else ""
         estado_grid = str(row[4]).strip() if len(row) > 4 else ""
 
-        if not plate_raw:
-            continue
-
         plate = normalize_plate(plate_raw)
+        if not plate or not is_valid_plate(plate):
+            continue
 
         pos = positions.get(plate, {})
         lat = pos.get("lat", 0.0)
@@ -1838,7 +1848,6 @@ def create_webhook_app():
                 vehicles = []
                 print(f"  Error GPS: {e}")
 
-            # Config dinámica
             if ANALYTICS_AVAILABLE:
                 an = get_analytics()
                 dynconfig = an.get("dynconfig")
@@ -2172,7 +2181,6 @@ def main():
                 except Exception as e:
                     print(f"  Error resumen: {e}")
 
-            # Reporte semanal — domingos a las 20hs
             if hora_local.weekday() == 6 and hora_local.hour == 20:
                 last_weekly = state.get("last_weekly_date", "")
                 if last_weekly != today.isoformat():
@@ -2191,7 +2199,6 @@ def main():
                     except Exception as e:
                         print(f"  Error reporte semanal: {e}")
 
-            # --- Obtener vehículos de ambas fuentes ---
             try:
                 devices = get_devices()
                 positions = get_positions()
@@ -2264,7 +2271,6 @@ def main():
                     if is_gps_temp_excluded(v):
                         continue
 
-                    # Analytics: registrar posición y detectar anomalías
                     if ANALYTICS_AVAILABLE and not pos_stale:
                         try:
                             an = get_analytics()
