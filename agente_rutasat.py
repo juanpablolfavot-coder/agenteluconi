@@ -2007,7 +2007,7 @@ def create_webhook_app():
 
                 if found:
                     stale = is_stale(found, STALE_POSITION_MINUTES)
-                    stale_tag = " ⚠️ sin actualización reciente" if stale else ""
+                    estado_nexpro = vehicle.get("_source") == "nexpro" and "sleep" in str(found.get("_estado_raw", "")).lower() if stale:     stale_tag = " 🌙 modo sleep" if estado_nexpro else " ⚠️ sin actualización reciente" else:     stale_tag = ""
                     fuente_tag = " [NexproConnect]" if found.get("_source") == "nexpro" else " [RutaSat]"
                     loc = format_location(found["lat"], found["lng"])
                     respuesta = (
