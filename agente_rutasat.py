@@ -483,7 +483,9 @@ def is_position_stale_nexpro(last_update_str, max_age_minutes=STALE_POSITION_MIN
     if not last_update_str:
         return True
 
-    clean = strip_html(last_update_str) # Normalizar hora sin cero: "1:01:00" → "01:01:00" import re as _re clean = _re.sub(r' (\d):', r' 0\1:', clean)
+    clean = strip_html(last_update_str)
+    # Normalizar hora sin cero: "1:01:00" → "01:01:00"
+    clean = re.sub(r' (\d):', r' 0\1:', clean)
 
     for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%y %H:%M:%S"):
         try:
@@ -1108,8 +1110,10 @@ def get_nexpro_vehicles() -> list:
             timeout=25,
         )
 
+        # FIX: agregado 500 — sesión expirada causa 500 en este endpoint,
+        # igual que 401/403. Forzar re-login y reintentar.
         if (
-            r.status_code in (302, 401, 403)
+            r.status_code in (302, 401, 403, 500)
             or "login" in r.url.lower()
             or (r.status_code == 200 and len(r.text) < 10)
         ):
@@ -2602,13 +2606,6 @@ def main():
 # ---------------------------------------------------------------------------
 # ENTRY POINT — FIX 1: gunicorn como servidor WSGI en producción
 # ---------------------------------------------------------------------------
-# Para Render, en lugar de python agente_rutasat.py, usar:
-#   gunicorn agente_rutasat:gunicorn_app --workers 1 --threads 2 --bind 0.0.0.0:$PORT
-#
-# En el Procfile o Start Command de Render poner exactamente esa línea.
-# gunicorn se instala con: pip install gunicorn
-# El script igual puede correrse directamente con python para desarrollo local.
-
 if __name__ == "__main__":
     import threading
 
@@ -2635,8 +2632,6 @@ if __name__ == "__main__":
 
 # ---------------------------------------------------------------------------
 # FIX 1: Objeto app para gunicorn
-# Gunicorn importa este módulo y busca la variable `gunicorn_app`.
-# El loop principal corre en un thread daemon al importar.
 # ---------------------------------------------------------------------------
 def _start_background_agent():
     """Inicia el agente en background cuando gunicorn importa el módulo."""
